@@ -1,6 +1,6 @@
 # Processus d'export et synchronisation Gitea → GitHub
 
-Ce document décrit le protocole d'exportation des modifications depuis le dépôt interne Gitea (`ac-dev-bot/ac-paperclip-adapters`) vers le dépôt public GitHub (`ptichalouf/paperclip-adapter-omniroute`).
+Ce document décrit le protocole d'exportation des modifications depuis le dépôt interne Gitea (`ac-dev-bot/ac-paperclip-adapters`) vers le dépôt public GitHub (`AC-CREATION-AI/paperclip-adapter-omniroute`).
 
 ---
 
