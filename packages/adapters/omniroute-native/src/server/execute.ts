@@ -69,7 +69,8 @@ import {
   type SkillMount,
 } from './skills.js';
 import { resolveHistoryBudgetChars, resolveIntraRunBudgetChars } from './session.js';
-import { calculateDynamicSessionBudgets, loadRemoteModelContext } from '../shared/context-window.js';
+import { calculateDynamicSessionBudgets } from '../shared/context-window.js';
+import { loadContextBudget } from '../shared/context-budget.js';
 import { isHistoryRejection, openRunSession, RunCheckpointer, startFreshAttempt } from './session-run.js';
 import { collectSecretValues, createRedactor, guardToolOutputs, redactJsonValue } from './secrets-redact.js';
 import type { WireMessage } from '../shared/wire.js';
@@ -154,7 +155,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<OmniRouteEx
       signal: null,
       timedOut: false,
       errorMessage:
-        'Aucune clé API OmniRoute configurée. Renseignez `apiKey` dans la config de l’adaptateur, ou OMNIROUTE_API_KEY / ANTHROPIC_API_KEY dans l’environnement.',
+        'Aucune clé API OmniRoute configurée. Renseignez `apiKey` dans la config de l’adaptateur, ou OMNIROUTE_API_KEY / ANTHROPIC_API_KEY dans les variables de l’agent (`env`) ou du serveur.',
       errorCode: 'omniroute_auth_rejected',
       errorFamily: null,
       retryNotBefore: null,
@@ -247,21 +248,33 @@ export async function execute(ctx: AdapterExecutionContext): Promise<OmniRouteEx
   // forme d'historique rejoué devant le modèle (dossier stable et privé,
   // écriture atomique sous verrou, purge : voir `session-run.ts`).
   const endEnsureSession = startPhase(ctx.onEvent, 'ensure_session');
-  const contextSpec = await loadRemoteModelContext(
-    config.baseUrl,
-    config.apiKey ?? '',
-    config.model,
+  // ACC-3085 — fenêtre lue à OmniRoute (modèle et repli), jamais écrite à la main.
+  const contextBudget = await loadContextBudget({
+    baseUrl: config.baseUrl,
+    apiKey: config.apiKey ?? '',
+    model: config.model,
+    fallbackModel: config.fallbackModel,
     signal,
-  );
-  const { historyBudgetChars, intraRunBudgetChars } = calculateDynamicSessionBudgets(
-    contextSpec.contextTokens,
-  );
-  const historyBudget = typeof config.maxContextChars === 'number' && config.maxContextChars > 0
+  });
+  const { historyBudgetChars, intraRunBudgetChars } = calculateDynamicSessionBudgets(contextBudget.tokens);
+  const manualChars = typeof config.maxContextChars === 'number' && config.maxContextChars > 0
     ? config.maxContextChars
-    : historyBudgetChars;
-  const intraRunBudget = typeof config.maxContextChars === 'number' && config.maxContextChars > 0
-    ? config.maxContextChars
-    : intraRunBudgetChars;
+    : null;
+  const historyBudget = manualChars ?? historyBudgetChars;
+  const intraRunBudget = manualChars ?? intraRunBudgetChars;
+  const maxTokens = contextBudget.maxOutputTokens !== null
+    ? Math.min(config.maxTokens, contextBudget.maxOutputTokens)
+    : config.maxTokens;
+  const contextWindow = {
+    ...contextBudget,
+    source: manualChars !== null ? 'config' as const : contextBudget.source,
+    historyBudgetChars: historyBudget,
+    intraRunBudgetChars: intraRunBudget,
+  };
+  await log(
+    'stdout',
+    `[omniroute_native] fenêtre de contexte ${contextWindow.tokens} tokens (source ${contextWindow.source} ; ${contextBudget.models.map((m) => `${m.id} ${m.tokens ?? 'inconnue'}`).join(', ')}) · sortie max ${maxTokens}`,
+  );
   const session = await openRunSession({
     context: ctx.context, runtime: ctx.runtime, workspaceCwd, historyBudget, redact,
     log: (text) => log('stdout', text), warn,
@@ -270,6 +283,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<OmniRouteEx
   let sessionParams = session.attempt.params;
   const checkpointer = new RunCheckpointer(session, context.onUsage, warn);
   if (!session.attempt.resumed && typeof (ctx as unknown as Record<string, unknown>)['getFreshSessionHandoff'] === 'function') {
+    delete ctx.context?.['paperclipFreshSessionHandoffMarkdown'];
     try {
       const getHandoff = (ctx as unknown as { getFreshSessionHandoff: () => Promise<string | null> }).getFreshSessionHandoff;
       const handoff = await getHandoff();
@@ -405,7 +419,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<OmniRouteEx
       initialUserMessage,
       history,
       tools: guardToolOutputs(tools, redact),
-      maxTokens: config.maxTokens,
+      maxTokens,
       reasoningEffort: config.reasoningEffort,
       cacheControlPoints: config.cacheControlPoints,
       sessionId: sessionParams.sessionId,
@@ -438,6 +452,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<OmniRouteEx
       sessionParams = fresh.attempt.params;
       checkpointer.newAttempt();
       await warn(`historique de la session ${previousId} refusé par le modèle : essai à neuf sur la session ${sessionParams.sessionId}`);
+      delete ctx.context?.['paperclipFreshSessionHandoffMarkdown'];
       const hostHandoff = await context.getFreshSessionHandoff?.().catch(() => null);
       return runLoop(
         joinPromptSections([fresh.handoff, typeof hostHandoff === 'string' ? hostHandoff.trim() : '', buildPrompt(ctx, { resumedSession: false })]),
@@ -498,6 +513,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<OmniRouteEx
         durationMs: Date.now() - started,
         cacheWriteTokens: result.cacheWriteTokens,
         gatewayHeaders: result.gatewayHeaders,
+        contextWindow,
         ...delegationResultFields(result),
       };
       return cancelled;
@@ -511,7 +527,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<OmniRouteEx
         exitCode: 1,
         signal: null,
         timedOut: false,
-        errorMessage: `Réponse coupée par la limite de sortie (maxTokens=${config.maxTokens}) malgré ${MAX_LENGTH_CONTINUATIONS} relance(s) : rien n'est publié.`,
+        errorMessage: `Réponse coupée par la limite de sortie (maxTokens=${maxTokens}) malgré ${MAX_LENGTH_CONTINUATIONS} relance(s) : rien n'est publié.`,
         errorCode: 'omniroute_output_truncated',
         errorFamily: 'configuration',
         retryNotBefore: null,
@@ -524,7 +540,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<OmniRouteEx
       truncated.costUsd = result.costUsd;
       truncated.sessionParams = sessionParams;
       truncated.sessionDisplayId = sessionParams.sessionId;
-      truncated.resultJson = { turns: result.turns, stopReason: result.stopReason, completion: result.completion, durationMs: Date.now() - started, ...delegationResultFields(result) };
+      truncated.resultJson = { turns: result.turns, stopReason: result.stopReason, completion: result.completion, durationMs: Date.now() - started, contextWindow, ...delegationResultFields(result) };
       return truncated;
     }
 
@@ -558,6 +574,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<OmniRouteEx
         completion: result.completion,
         durationMs: Date.now() - started,
         sessionId: sessionParams.sessionId,
+        contextWindow,
         ...delegationResultFields(result),
       };
       return noFinal;
@@ -595,6 +612,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<OmniRouteEx
         sessionId: sessionParams.sessionId,
         resumedSession: session.attempt.resumed,
         ...(session.attempt.freshRetry ? { sessionRestartedFresh: true } : {}),
+        // ACC-3085 — fenêtre détectée et seuils appliqués, avec leur source.
+        contextWindow,
         ...delegationResultFields(result),
         // Paperclip lit `resultJson.finalResponse` pour décider de la réponse
         // publiée (`heartbeat-run-summary.ts:readMarkedAdapterFinalResponse` :
@@ -605,13 +624,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<OmniRouteEx
         // filtré par `NARRATION_OPENERS` et n'est pas le contrat natif.
         // Cartes de décision v1.2 : aucune finalResponse ni summary en attente humaine
         // pour ne pas polluer le fil de discussion Paperclip avec un dump JSON d'outil.
+        // Masquage (t_e8b687c2) : le texte publié passe par le même masqueur
+        // que le transcript et la session — une clé connue renvoyée par le
+        // modèle ne sort pas en clair dans le commentaire Paperclip.
         ...(result.completion === 'completed' && !result.waitingForHuman && result.finalText.trim().length > 0
           ? {
               finalResponse: {
                 disposition: 'final' as const,
-                text: result.finalText,
+                text: redact(result.finalText),
               },
-              summary: result.finalText,
+              summary: redact(result.finalText),
             }
           : {}),
       },
@@ -837,7 +859,7 @@ function buildPrompt(ctx: AdapterExecutionContext, options: { resumedSession: bo
   const freshHandoff = typeof freshHandoffRaw === 'string' ? freshHandoffRaw.trim() : '';
   const sessionHandoffNote = asString(context['paperclipSessionHandoffMarkdown'], '').trim();
 
-  const handoffSection = freshHandoff.length > 0
+  const handoffSection = options.resumedSession ? '' : freshHandoff.length > 0
     ? `## Passation de session précédente\n\n${freshHandoff}`
     : sessionHandoffNote.length > 0
       ? `## Passation de session précédente\n\n${sessionHandoffNote}`
@@ -882,7 +904,7 @@ function buildInvariantEnvironmentSection(): string {
     '- `PAPERCLIP_API_URL` : URL de base du serveur Paperclip.',
     '- `PAPERCLIP_AGENT_ID` : Identifiant de cet agent.',
     '- `PAPERCLIP_COMPANY_ID` : Identifiant de l\'organisation.',
-    '- `PAPERCLIP_HOME` : Répertoire de base de l\'agent.',
+    '- `AGENT_HOME` : Répertoire de base de l\'agent.',
     '',
     'Variables propres à chaque mission injectées dans le shell :',
     'PAPERCLIP_TASK_ID, PAPERCLIP_RUN_ID, PAPERCLIP_WAKE_REASON, PAPERCLIP_WORKSPACE_CWD.',

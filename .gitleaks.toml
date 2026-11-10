@@ -1,0 +1,107 @@
+# .gitleaks.toml — gabarit commun anti-fuite AC-Creation (ACC-2400, 02/11/2026).
+# Lu par .gitea/workflows/secret-scan.yml ET par le hook pre-commit.
+# Regles et liste blanche reprises a l'identique de AC-Creation-public/normes
+# (.gitleaks.toml, branche par defaut, lu le 02/11/2026) pour que les 19 depots
+# deja equipes et les nouveaux partagent les memes regles.
+# Doctrine : exclusions par VALEUR entiere (ancree ^...$), jamais par chemin,
+# jamais de .gitleaksignore (refuse par la CI), jamais `gitleaks:allow`
+# (la CI tourne avec --ignore-gitleaks-allow).
+# Dette existante : la figer dans .gitleaks-baseline.json, generee par
+#   gitleaks git --no-banner --redact --ignore-gitleaks-allow --max-archive-depth 2 \
+#     --config .gitleaks.toml --log-opts="--all --remerge-diff" \
+#     --report-format json --report-path .gitleaks-baseline.json .
+# puis revoquer chaque secret de la baseline (une baseline n'est pas un pardon).
+[extend]
+# Sans cette ligne gitleaks tourne avec ZERO regle (incident BO 2026-08-09).
+# La CI echoue si elle disparait.
+useDefault = true
+
+# --- Regles maison AC-Creation (normes PR #31, t_51169fb4) -----------------
+[[rules]]
+id = "ac-creation-sk-internal-key"
+description = "Cle interne AC-Creation au format sk-ac-creation-*"
+regex = '''sk-ac-creation-[a-z0-9-]+'''
+
+[[rules]]
+id = "ac-creation-gitea-token"
+description = "Jeton Gitea (40 hex) en contexte token/Authorization/Bearer"
+regex = '''(?i)(?:token|authorization|bearer)[^a-zA-Z0-9]{0,20}["']?([0-9a-f]{40})'''
+secretGroup = 1
+
+[[rules]]
+id = "ac-creation-mcp-proxy-token"
+description = "MCP_PROXY_TOKEN (64 hex) — auth du hub MCP AC-Creation"
+regex = '''(?i)mcp_proxy_token[^a-zA-Z0-9]{0,10}["']?([0-9a-f]{64})'''
+secretGroup = 1
+
+[[rules]]
+id = "ac-creation-pat-in-git-remote-url"
+description = "PAT 40 hex dans une URL de remote git authentifiee (user:PAT@host)"
+regex = '''://[^:/@\s"]+:([0-9a-f]{40})@'''
+secretGroup = 1
+
+# --- Regles ajoutees ACC-487 (2026-10-02) ----------------------------------
+# Mesure sur infra-as-code : deux secrets connus echappaient aux regles par
+# defaut — une cle Qdrant de 21 car. minuscules (entropie < seuil de
+# generic-api-key) et une ApiKey *arr (32 hex) dans un config.xml archive.
+[[rules]]
+id = "ac-creation-qdrant-api-key"
+# Limite (revue ACC-521) : l'en-tete HTTP `api-key: ...` sans le mot `qdrant`
+# n'est PAS reconnu par cette regle.
+description = "Cle API Qdrant affectee en clair (QDRANT_API_KEY=..., qdrant_api_key: ...)"
+regex = '''(?i)qdrant[_-]?api[_-]?key["'`]?\s*[:=]\s*["'`]?([A-Za-z0-9_-]{16,})'''
+secretGroup = 1
+
+[[rules]]
+id = "ac-creation-arr-xml-api-key"
+description = "ApiKey Sonarr/Radarr/Prowlarr (32 hex) dans un config.xml"
+regex = '''<ApiKey>([0-9a-f]{32})</ApiKey>'''
+secretGroup = 1
+
+# --- Allowlist minimale, par VALEUR ----------------------------------------
+# Revue 2026-10-02 (ACC-533, revues A/B des PR agent-templates-kb#5,
+# mcp-proxy-admin#8, paperclip-setup#11) : l'ancienne entree
+# `sk-[a-z0-9-]+-(test|demo|...)$` exemptait TOUTE cle maison finissant par
+# -demo/-test, et les motifs non ancres (`placeholder...`, `changeme...`,
+# `...example...`) exemptaient une vraie cle qui les contenait. Le suffixe
+# d'une cle ne prouve pas qu'elle est factice. Desormais :
+#   - les cles maison factices sont NOMMEES, valeur entiere, ancree ;
+#   - tous les autres motifs sont ancres `^...$` : ils decrivent la valeur
+#     ENTIERE (revue A #1492 : `REDACTED` ou l'UUID nul en sous-chaine
+#     exemptaient `sk-ac-creation-<alea>-00000000-...` et une generic-api-key) ;
+#   - aucun motif ne laisse de suite libre (revues ACC-520/ACC-521, ACC-570) :
+#     `^changeme...*`, `^PLACEHOLDER...*`, `^placeholder...{4,}`,
+#     `^REPLACE-ME...*`, `^sk-test-...{8,}` et `<mots>-example` exemptaient
+#     une vraie cle precedee de ces mots (`QDRANT_API_KEY=changeme<alea>`).
+#     Mesure le 2026-10-02 sur normes et les 3 depots adoptants : ces motifs
+#     n'exemptaient aucune trouvaille, il ne reste que des valeurs entieres.
+# Le job `Secret scan` verifie a chaque run que `sk-ac-creation-<alea>-demo`
+# (et -test, -example, -sample, -placeholder, -none, -changeme, -<UUID nul>)
+# et `changeme<alea>`, `PLACEHOLDER<alea>`, `REPLACE-ME<alea>`,
+# `sk-test-<alea>`, `<lettres>-example` restent signales.
+# Ajouter une valeur factice = l'ajouter en entier ci-dessous, en revue.
+# gitleaks >= 8.28 refuse [allowlist] a cote de [[allowlists]] : meme socle, nouvelle syntaxe (ACC-3031).
+[[allowlists]]
+description = "Placeholders evidents (valeurs entieres) — socle normes PR #31, borne ACC-533/ACC-570"
+regexes = [
+  '''^sk-ac-creation-(magasin-)?(test|demo|example|placeholder|sample|none)$''',
+  '''(?i)^(replace-me|placeholder|changeme)$''',
+  '''^YOUR[-_](KEY|TOKEN|SECRET|PASSWORD)$''',
+  '''^00000000-0000-0000-0000-000000000000$''',
+  '''^REDACTED$''',
+  '''^\*{3,}$''',
+  '''(?i)^(example|your[-_]example[-_](key|token|secret|password))$''',
+]
+
+# --- Exceptions ciblees ACC-3031 (02/11/2026) ----------------------------------
+# Tri des trouvailles du premier passage gitleaks (PR ci/gitleaks-20261102).
+# Chaque bloc = 1 fichier exact (chemin ancre) + 1 regle + 1 forme (condition AND) :
+# toute autre valeur, regle ou fichier reste signale (sonde verifiee en local).
+# Empreintes sha256[:8] des valeurs et verdict : RAPPORT.md ACC-3031
+
+[[allowlists]]
+description = "Historique seulement : valeurs fictives du test de masquage, desormais assemblees a l'execution (ACC-3031). Limite aux 2 commits d'origine ; l'arbre courant reste scanne"
+targetRules = ["generic-api-key", "private-key"]
+condition = "AND"
+paths = ['''^packages/adapters/omniroute-native/test/secu-redaction\.test\.ts$''']
+commits = ["14e8cc19632285d4d0ab188d50d05c38faf53cf1", "7885a166adbd46f218465c85e70c68317d8e343c"]

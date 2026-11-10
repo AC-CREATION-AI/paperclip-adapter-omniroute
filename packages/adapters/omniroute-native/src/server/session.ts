@@ -40,7 +40,7 @@ import type { WireMessage } from '../shared/wire.js';
 import { calculateDynamicSessionBudgets } from '../shared/context-window.js';
 import { CONTINUE_PROMPT, FINAL_ANSWER_PROMPT } from './agent-loop.js';
 import { redactSecrets, redactWireMessages } from './secrets-redact.js';
-import { ensurePrivateDir, withSessionLock, writeFileAtomic, type LockOptions } from './session-store.js';
+import { ensurePrivateDir, isCompatibleSessionEnvelope, withSessionLock, writeFileAtomic, type LockOptions } from './session-store.js';
 
 /** Marqueur porté par nos `sessionParams` : distingue nos sessions d'autres. */
 export const SESSION_MARKER_KEY = 'omnirouteNativeSession';
@@ -190,8 +190,11 @@ interface StoredSession {
 
 export type SessionLoadStatus = 'missing' | 'ok' | 'corrupt';
 
+/** État interne distinct pour interdire aussi l'écrasement d'un format incompatible. */
+type SessionFileState = { messages: WireMessage[]; status: SessionLoadStatus | 'incompatible' };
+
 /** Lit et valide un fichier de session (sans verrou ni masquage). */
-async function readSessionFile(file: string): Promise<{ messages: WireMessage[]; status: SessionLoadStatus }> {
+async function readSessionFile(file: string, sessionId: string): Promise<SessionFileState> {
   let raw: string;
   try {
     raw = await fs.readFile(file, 'utf8');
@@ -200,7 +203,12 @@ async function readSessionFile(file: string): Promise<{ messages: WireMessage[];
   }
   try {
     const parsed = JSON.parse(raw) as StoredSession;
-    if (!Array.isArray(parsed?.messages)) return { messages: [], status: 'corrupt' };
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { messages: [], status: 'corrupt' };
+    // Tous nos écrivains historiques portent version:1 et l'ID logique exact.
+    // Pas de migration implicite : ni les versions inconnues/non versionnées,
+    // ni une collision de nom assaini ne doivent rejouer un autre checkpoint.
+    if (!isCompatibleSessionEnvelope(parsed, sessionId)) return { messages: [], status: 'incompatible' };
+    if (!Array.isArray(parsed.messages)) return { messages: [], status: 'corrupt' };
     // Validation profonde : un fichier JSON valide peut contenir des blocs
     // corrompus (`content: [null]`) qui faisaient lever trimSessionMessages
     // avant le try principal du run (audit A9). Un bloc invalide est écarté,
@@ -220,15 +228,18 @@ async function readSessionFile(file: string): Promise<{ messages: WireMessage[];
 /**
  * Charge l'historique d'une session, **masqué** (un ancien fichier peut
  * contenir un secret écrit avant le masquage), avec son état : `corrupt`
- * signale un fichier tronqué ou illisible, à remonter en avertissement.
+ * signale un fichier tronqué, illisible ou d'enveloppe incompatible. Seuls
+ * version:1 et l'ID logique concordant sont repris ; aucun fichier n'est
+ * migré à la lecture. Un écrivain refuse aussi l'enveloppe incompatible.
  */
 export async function loadSessionState(
   baseDir: string,
   sessionId: string,
   redact: (text: string) => string = (text) => redactSecrets(text),
 ): Promise<{ messages: WireMessage[]; status: SessionLoadStatus }> {
-  const state = await readSessionFile(sessionFilePath(baseDir, sessionId));
-  return { messages: redactWireMessages(state.messages, redact), status: state.status };
+  const state = await readSessionFile(sessionFilePath(baseDir, sessionId), sessionId);
+  // Conserve l'avertissement `corrupt` des appelants, sans exposer l'historique.
+  return { messages: redactWireMessages(state.messages, redact), status: state.status === 'incompatible' ? 'corrupt' : state.status };
 }
 
 /** Charge l'historique d'une session. Un fichier absent ou illisible = aucun historique. */
@@ -261,7 +272,11 @@ async function updateSessionFile(
     await withSessionLock(
       file,
       async () => {
-        const disk = (await readSessionFile(file)).messages;
+        const state = await readSessionFile(file, sessionId);
+        // La relecture sous verrou protège aussi les écritures directes et un
+        // fichier remplacé après l'ouverture du run. Ne pas perdre la source.
+        if (state.status === 'incompatible') throw new Error('fichier de session incompatible : version ou identité discordante ; source conservée');
+        const disk = state.messages;
         const payload: StoredSession = {
           version: 1,
           sessionId,

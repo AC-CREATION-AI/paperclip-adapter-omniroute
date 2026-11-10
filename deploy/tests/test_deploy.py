@@ -11,6 +11,7 @@ Aucun accès réseau, aucun accès à Paperclip : tout est local et jetable.
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import pathlib
@@ -305,6 +306,15 @@ class FakeRemote:
         self._health_bad = False
         self._logs = ""
         self.commands = []
+        self.native_runs = 0          # runs actifs d'agents omniroute_native
+        self.other_runs = 0           # runs actifs des autres adaptateurs
+        self.installs = []            # chemins passés à POST /api/adapters/install
+        self.install_failures = 0     # nombre d'install à faire échouer
+        self.install_status = None    # 401/403 : échec d'install = refus d'authentification
+        self.stale_install = False    # install accepté mais l'ancien code reste servi
+        self.test_env_calls = []      # (société, agent) passés à test-environment
+        self.served = None            # chemin réel du code exécuté par le serveur
+        self._loaded = {}             # cache ESM : chemin déjà importé → chemin réel figé
 
     # -- exécution réelle, locale --
     def _run(self, cmd, input_bytes=None, check=True):
@@ -344,7 +354,10 @@ class FakeRemote:
         return "2026-10-31T00:00:00Z"
 
     def active_runs_raw(self):
-        return "0\n"
+        return f"{self.native_runs + self.other_runs}\n"
+
+    def active_native_runs_raw(self):
+        return f"{self.native_runs}\n"
 
     def health(self):
         return "502" if self._health_bad else "200"
@@ -354,7 +367,56 @@ class FakeRemote:
         self._health_bad = self.health_failures > 0
         if self.health_failures:
             self.health_failures -= 1
-        self._logs = "\n".join(json.dumps(line) for line in fake_loader(self.ct_home)["lines"])
+        got = fake_loader(self.ct_home)
+        self._loaded = {got["local"]: got["real"]} if got["ok"] else {}
+        self.served = got["real"]
+        self._logs = "\n".join(json.dumps(line) for line in got["lines"])
+
+    # -- serveur en service : POST /api/adapters/install, GET /api/adapters/:type --
+    def _registry(self):
+        try:
+            return json.loads(pathlib.Path(self.ct_home, "adapter-plugins.json").read_text())
+        except json.JSONDecodeError:
+            return []
+
+    def install_adapter(self, path):
+        """Comme le serveur : importe `path` (resservi depuis le cache s'il l'a déjà été),
+        remplace l'adaptateur en mémoire, réécrit le registre avec ce chemin."""
+        self.installs.append(path)
+        if self.install_failures:
+            self.install_failures -= 1
+            if self.install_status:
+                raise self.d.ApiError(self.install_status, "POST /api/adapters/install : HTTP "
+                                      f"{self.install_status} Instance admin access required")
+            raise RuntimeError("install refusé (simulé)")
+        version = json.loads(pathlib.Path(path, "package.json").read_text())["version"]
+        if not self.stale_install:
+            self.served = self._loaded.setdefault(path, os.path.realpath(path))
+        rec = {"packageName": path, "localPath": path, "version": version,
+               "type": "omniroute_native", "installedAt": "2026-10-31T00:00:00.000Z"}
+        regs = [r for r in self._registry() if r.get("type") != "omniroute_native"] + [rec]
+        pathlib.Path(self.ct_home, "adapter-plugins.json").write_text(
+            self.d.serialize_registry(regs))
+        self._logs += "\n" + json.dumps({"msg": "External adapter installed and registered",
+                                         "type": "omniroute_native", "packageName": path})
+        return {"type": "omniroute_native", "packageName": path, "version": version,
+                "requiresRestart": True}
+
+    def adapter_info(self):
+        rec = next(r for r in self._registry() if r.get("type") == "omniroute_native")
+        version = json.loads(pathlib.Path(rec["localPath"], "package.json").read_text())["version"]
+        return {"type": "omniroute_native", "source": "external", "loaded": True,
+                "version": version}
+
+    def served_marker(self):
+        return pathlib.Path(self.served, "MARKER").read_text() if self.served else None
+
+    def test_environment(self, company, agent=None):
+        """POST /api/companies/:c/adapters/:type/test-environment : exécute le code SERVI."""
+        self.test_env_calls.append((company, agent))
+        return {"adapterType": "omniroute_native", "status": "pass",
+                "checks": [{"code": "marker", "level": "info",
+                            "message": f"code servi : {self.served_marker()}"}]}
 
     def server_logs(self, since):
         return self._logs
@@ -394,9 +456,8 @@ def fake_probe(rm, home, *, expect_dir=None, catalogue=True, allow_real_home=Fal
             "loaderLogs": {}}
 
 
-class ApplyRollbackTests(unittest.TestCase):
-    """Retour arrière testé à blanc (revue A 58201, point bloquant) : ROUGE si le
-    registre ou `current` ne sont pas restaurés."""
+class _DeployCase(unittest.TestCase):
+    """Production factice : ancienne installation agency-starter + deux artefacts."""
 
     def setUp(self):
         self.d = load_deploy_module()
@@ -452,6 +513,51 @@ class ApplyRollbackTests(unittest.TestCase):
         report = {}
         self.d.rollback(self.rm, self.args, state, report)
         return report
+
+
+class DamagedRegistryRollbackTests(_DeployCase):
+    def test_truncated_registry_hot_and_cold(self):
+        for hot in (False, True):
+            with self.subTest(hot=hot):
+                self.args.hot = hot
+                self.args = self.d.parse_args(["--rollback", "--hot", "--skip-catalogue"]
+                                              if hot else ["--rollback", "--skip-catalogue"])
+                (self.home / "adapter-plugins.json").write_bytes(self.registry0)
+                self.apply(self.art1)
+                damaged = b'[{"type":'
+                (self.home / "adapter-plugins.json").write_bytes(damaged)
+                report = self.rollback()
+                self.assertFalse(report["rollbackChecks"]["errors"])
+                self.assertEqual(self.effective_marker(), "ancienne installation")
+                saved = list(pathlib.Path(self.rm.backup_root).glob("*.before-rollback"))
+                self.assertTrue(any(p.read_bytes() == damaged for p in saved))
+
+    def test_registre_json_valide_mais_pas_une_liste(self):
+        for raw in (b"null", b"{}", b'"x"'):
+            with self.subTest(raw=raw):
+                (self.home / "adapter-plugins.json").write_bytes(raw)
+                st = self.d.read_state(self.rm)
+                self.assertEqual((st["records"], st["localPath"]), ([], None))
+
+    def test_hot_without_previous_version_refuses_before_mutation(self):
+        self.args.hot = True
+        self.apply(self.art1)
+        state_path = next(pathlib.Path(self.rm.backup_root).glob("*.state.json"))
+        state = json.loads(state_path.read_text())
+        state["previous"].update(localPath=None, current=None)
+        state_path.write_text(json.dumps(state))
+        before = self.registry(), self.current(), list(self.rm.installs), self.rm.restarts
+        self.rm.commands.clear()
+        with self.assertRaisesRegex(SystemExit, "ancienne version"):
+            self.rollback()
+        self.assertEqual(before, (self.registry(), self.current(), self.rm.installs, self.rm.restarts))
+        self.assertFalse(any("cp -p" in c or "tar -x" in c or "ln -s" in c
+                             for c in self.rm.commands))
+
+
+class ApplyRollbackTests(_DeployCase):
+    """Retour arrière testé à blanc (revue A 58201, point bloquant) : ROUGE si le
+    registre ou `current` ne sont pas restaurés."""
 
     # -- cas 1 : première bascule (agency-starter → installation dédiée) --
     def test_premiere_bascule_puis_retour_arriere(self):
@@ -527,6 +633,338 @@ class ApplyRollbackTests(unittest.TestCase):
             self.d.apply(self.rm, r2_args, art, self.d.read_state(self.rm), {})
         self.assertIn("--rollback", str(ctx.exception.code))
         self.assertTrue(self.current().endswith("-2222222"))
+
+
+class HotUpdateTests(_DeployCase):
+    """--hot (ACC-3039) : mise à jour sans redémarrage, par install du chemin VERSIONNÉ.
+
+    Le faux serveur garde en cache le code d'un chemin déjà importé, comme Node : un
+    `reload` sur `current` resservirait l'ancien code (constaté sur IA, ACC-3037)."""
+
+    def setUp(self):
+        super().setUp()
+        self.apply(self.art1)                 # r1 installé à froid, registre sur current
+        self.r1, self.reg_r1 = self.current(), self.registry()
+        self.restarts0 = self.rm.restarts
+        self.args = self.d.parse_args(["--apply", "--hot", "--skip-catalogue"])
+
+    def release(self, rel):
+        return str(self.home / "adapter-plugins/omniroute-native" / rel)
+
+    def test_installe_le_chemin_versionne_sans_redemarrer(self):
+        self.apply(self.art2)
+        self.assertEqual(self.rm.restarts, self.restarts0, "aucun redémarrage en --hot")
+        self.assertTrue(self.current().endswith("-2222222"), self.current())
+        r2 = self.release(self.current())
+        self.assertEqual(self.rm.installs, [r2], "install sur releases/<…>, jamais current")
+        self.assertEqual(json.loads(self.registry())[-1]["localPath"], r2)
+        self.assertEqual(self.rm.served_marker(), "r2", "le serveur exécute le nouveau code")
+        state = json.loads(pathlib.Path(self.rm.backup_root,
+                                        self.d.latest_state(os.listdir(self.rm.backup_root))).read_text())
+        self.assertEqual(state["mode"], "hot")
+        self.assertEqual(state["new"]["localPath"], r2)
+
+    def test_runs_d_autres_adaptateurs_acceptes_runs_natifs_refuses(self):
+        self.rm.other_runs = 2
+        self.apply(self.art2)                 # d'autres adaptateurs tournent : accepté
+        self.assertEqual(self.rm.served_marker(), "r2")
+        self.rm.native_runs = 1
+        with self.assertRaises(SystemExit) as ctx:
+            self.apply(self.art1)
+        self.assertIn("omniroute_native", str(ctx.exception.code))
+
+    def test_sans_mode_hot_les_runs_d_autres_adaptateurs_bloquent(self):
+        self.rm.other_runs = 1
+        self.args = self.d.parse_args(["--apply", "--skip-catalogue"])
+        with self.assertRaises(SystemExit):
+            self.apply(self.art2)
+
+    def test_echec_de_l_install_retour_arriere_a_chaud(self):
+        self.rm.install_failures = 1
+        with self.assertRaises(SystemExit):
+            self.apply(self.art2)
+        self.assertEqual(self.current(), self.r1, "current non restauré")
+        self.assertEqual(self.rm.restarts, self.restarts0, "retour arrière à chaud : pas de redémarrage")
+        self.assertEqual(self.rm.installs[-1], self.release(self.r1))
+        self.assertEqual(self.rm.served_marker(), "r1")
+
+    def test_retour_arriere_a_chaud(self):
+        self.apply(self.art2)
+        self.rollback()
+        self.assertEqual(self.current(), self.r1)
+        self.assertEqual(self.rm.installs[-1], self.release(self.r1))
+        self.assertEqual(self.rm.served_marker(), "r1")
+        self.assertEqual(self.rm.restarts, self.restarts0)
+        self.assertTrue(any(n.endswith(".before-rollback") for n in os.listdir(self.rm.backup_root)))
+
+    def test_apply_a_froid_apres_hot_remet_le_registre_sur_current(self):
+        self.apply(self.art2)
+        self.args = self.d.parse_args(["--apply", "--skip-catalogue"])
+        self.apply(self.art1)
+        mine = [r for r in json.loads(self.registry()) if r["type"] == "omniroute_native"]
+        self.assertEqual([r["localPath"] for r in mine],
+                         [str(self.home / "adapter-plugins/omniroute-native/current")])
+        self.assertEqual(self.effective_marker(), "r1")
+
+    def test_check_accepte_le_registre_sur_la_version_visee_par_current(self):
+        self.apply(self.art2)
+        report = {}
+        rc = self.d.check(self.rm, self.d.parse_args(["--check", "--skip-catalogue"]), report)
+        self.assertEqual(rc, 0, report["check"]["errors"])
+        self.assertNotIn("warnings", report["check"])
+
+    def test_journal_d_install_a_chaud(self):
+        info = self.d.parse_loader_logs(json.dumps(
+            {"msg": "External adapter installed and registered", "type": "omniroute_native",
+             "packageName": NEW}))
+        self.assertEqual(info["installed"], [NEW])
+        self.assertEqual(self.d.post_check_errors(info, "omniroute_native", NEW), [])
+
+    # -- remarques de relecture ACC-3101 (ex-ACC-3111) --
+    def test_code_servi_controle_par_test_environment(self):
+        self.args = self.d.parse_args(["--apply", "--hot", "--skip-catalogue",
+                                       "--served-company", "c1", "--served-agent", "a1",
+                                       "--expect-served", "code servi : r2"])
+        report = {}
+        with self.assertRaises(SystemExit):
+            self.d.apply(self.rm, self.args, self.d.ensure_artifact(str(self.art2)),
+                         self.d.read_state(self.rm), report)
+        self.assertTrue(report["postChecks"]["errors"])
+        self.assertTrue(report["rollbackChecks"]["errors"], "API actuelle sans preuve")
+
+    def test_ancien_code_encore_servi_declenche_le_retour_arriere(self):
+        # Registre, version annoncée et sonde passent : seul le code servi le révèle.
+        self.rm.stale_install = True
+        self.args = self.d.parse_args(["--apply", "--hot", "--skip-catalogue",
+                                       "--served-company", "c1", "--expect-served", "code servi : r2"])
+        report = {}
+        art = self.d.ensure_artifact(str(self.art2))
+        with self.assertRaises(SystemExit):
+            self.d.apply(self.rm, self.args, art, self.d.read_state(self.rm), report)
+        self.assertTrue(any("code servi" in e for e in report["postChecks"]["errors"]),
+                        report["postChecks"]["errors"])
+        self.assertEqual(self.current(), self.r1)
+        self.assertEqual(self.rm.installs[-1], self.release(self.r1))
+        self.assertTrue(report["rollbackChecks"]["errors"])
+
+    def test_sans_societe_le_code_servi_est_signale_non_verifie(self):
+        report = self.apply(self.art2)
+        self.assertEqual(self.rm.test_env_calls, [])
+        self.assertTrue(any("code servi non vérifié" in w
+                            for w in report["postChecks"].get("warnings", [])))
+
+    def test_install_refuse_par_authentification_sans_retour_arriere_inutile(self):
+        for status in (401, 403):
+            with self.subTest(status=status):
+                self.rm.installs.clear()
+                self.rm.install_failures, self.rm.install_status = 1, status
+                with self.assertRaises(SystemExit) as ctx:
+                    self.apply(self.art2)
+                msg = str(ctx.exception.code)
+                self.assertIn(str(status), msg)
+                self.assertIn("--admin-token-file", msg)
+                self.assertEqual(len(self.rm.installs), 1, "aucun install de retour arrière")
+                self.assertEqual(self.current(), self.r1, "current remis sur sa cible")
+                self.assertEqual(self.registry(), self.reg_r1)
+                self.assertEqual(self.rm.restarts, self.restarts0)
+                self.assertEqual(self.rm.served_marker(), "r1")
+
+    def test_retour_arriere_a_chaud_refuse_par_authentification(self):
+        self.apply(self.art2)
+        self.rm.install_failures, self.rm.install_status = 1, 401
+        with self.assertRaises(SystemExit) as ctx:
+            self.rollback()
+        msg = str(ctx.exception.code)
+        self.assertIn("401", msg)
+        self.assertIn("--admin-token-file", msg)
+        self.assertEqual(self.rm.served_marker(), "r2")
+
+    def test_apply_auth_error_after_install_rolls_back(self):
+        for method in ("adapter_info", "test_environment"):
+            for status in (401, 403):
+                with self.subTest(method=method, status=status):
+                    self.args = self.d.parse_args([
+                        "--apply", "--hot", "--skip-catalogue", "--served-company", "c1"])
+                    original = getattr(self.rm, method)
+                    error = self.d.ApiError(status, f"{method}: HTTP {status}")
+                    with mock.patch.object(self.rm, method, side_effect=[error, original() if method == "adapter_info"
+                                                                           else original("c1")]):
+                        report = {}
+                        with self.assertRaises(SystemExit) as ctx:
+                            self.d.apply(self.rm, self.args,
+                                         self.d.ensure_artifact(str(self.art2)),
+                                         self.d.read_state(self.rm), report)
+                    self.assertIsNotNone(ctx.exception.code)
+                    self.assertNotIn("authRefused", report["postChecks"])
+                    self.assertTrue(report["rollbackChecks"]["errors"])
+                    self.assertEqual(self.rm.served_marker(), "r1")
+                    self.assertEqual(self.current(), self.r1)
+                    self.assertEqual(self.rm.installs[-1], self.release(self.r1))
+
+    def test_rollback_auth_error_after_install_reports_failed_checks(self):
+        for method in ("adapter_info", "test_environment"):
+            for status in (401, 403):
+                with self.subTest(method=method, status=status):
+                    self.args = self.d.parse_args([
+                        "--apply", "--hot", "--skip-catalogue", "--served-company", "c1"])
+                    with mock.patch.object(self.d, "served_check_errors", return_value=[]):
+                        self.apply(self.art2)
+                    report = {}
+                    with mock.patch.object(self.rm, method, side_effect=self.d.ApiError(
+                            status, f"{method}: HTTP {status}")):
+                        with self.assertRaises(SystemExit) as ctx:
+                            self.d.rollback(self.rm, self.args, None, report)
+                    self.assertIn("contrôles en échec", str(ctx.exception.code))
+                    self.assertNotIn("sert toujours la version installée", str(ctx.exception.code))
+                    self.assertNotIn("authRefused", report["rollbackChecks"])
+                    self.assertIn(str(status), report["rollbackChecks"]["errors"][0])
+                    self.assertEqual(self.rm.served_marker(), "r1")
+                    self.assertEqual(self.current(), self.r1)
+                    self.assertEqual(self.rm.installs[-1], self.release(self.r1))
+
+    def _edit_previous(self, **previous):
+        state_path = pathlib.Path(self.rm.backup_root,
+                                  self.d.latest_state(os.listdir(self.rm.backup_root)))
+        state = json.loads(state_path.read_text())
+        state["previous"].update(previous)
+        state_path.write_text(json.dumps(state))
+
+    def test_retour_arriere_a_chaud_vers_une_version_sans_current(self):
+        # Ancien registre sur releases/<…> mais `current` absent : la version de repli
+        # est ce chemin même, jamais « …/None ».
+        self.apply(self.art2)
+        self._edit_previous(localPath=self.release(self.r1), current=None)
+        report = self.rollback()
+        self.assertFalse(report["rollbackChecks"]["errors"])
+        self.assertEqual(self.rm.installs[-1], self.release(self.r1))
+        self.assertEqual(self.rm.served_marker(), "r1")
+
+    def test_retour_arriere_a_chaud_sur_current_absent_refuse_avant_mutation(self):
+        self.apply(self.art2)
+        self._edit_previous(localPath=str(self.home / "adapter-plugins/omniroute-native/current"),
+                            current=None)
+        before = self.registry(), self.current(), list(self.rm.installs)
+        with self.assertRaisesRegex(SystemExit, "ancienne version"):
+            self.rollback()
+        self.assertEqual(before, (self.registry(), self.current(), self.rm.installs))
+
+    def test_erreurs_du_code_servi(self):
+        f = self.d.served_check_errors
+        ok = {"adapterType": "omniroute_native", "checks": [{"message": "Source : env(agent):X",
+                                                            "detail": "d"}]}
+        for expect in (None, "env(agent)", "absent"):
+            self.assertTrue(f(ok, expect), "texte commun jamais preuve d'import")
+
+    def test_cible_du_retour_arriere_a_chaud(self):
+        inst = "/x/adapter-plugins/omniroute-native"
+        f = self.d.hot_rollback_target
+        self.assertEqual(f({"localPath": f"{inst}/current", "current": "releases/r1"}, inst),
+                         f"{inst}/releases/r1")
+        self.assertEqual(f({"localPath": f"{inst}/releases/r1", "current": "releases/r1"}, inst),
+                         f"{inst}/releases/r1")
+        self.assertEqual(f({"localPath": OLD, "current": None}, inst), OLD)
+
+
+class HostOptionsTests(unittest.TestCase):
+    """Hôte cible paramétrable en ligne de commande (ACC-3039 : instance IA)."""
+
+    def setUp(self):
+        self.d = load_deploy_module()
+
+    def test_options_d_hote(self):
+        a = self.d.parse_args(["--container", "paperclip-ac", "--host-home", "/srv/pc-ac",
+                               "--backup-root", "/srv/backups/pc-ac"])
+        rm = self.d.make_remote(a)
+        self.assertEqual((rm.container, rm.host_home, rm.backup_root),
+                         ("paperclip-ac", "/srv/pc-ac", "/srv/backups/pc-ac"))
+        self.assertEqual(rm.ct_home, "/paperclip")
+        d = self.d.make_remote(self.d.parse_args([]))
+        self.assertEqual((d.container, d.host_home, d.backup_root),
+                         (self.d.CONTAINER, self.d.HOST_HOME, self.d.BACKUP_ROOT))
+
+    def test_chemins_d_hote_controles(self):
+        with self.assertRaises(ValueError):
+            self.d.make_remote(self.d.parse_args(["--host-home", "/srv/a b"]))
+
+    def test_redemarrage_vise_le_conteneur_choisi(self):
+        rm = self.d.make_remote(self.d.parse_args(["--container", "paperclip-ac"]))
+        with mock.patch.object(rm, "ssh") as ssh:
+            rm.restart()
+        self.assertIn("docker restart paperclip-ac", ssh.call_args[0][0])
+
+    def test_hot_refuse_avec_check_ou_sandbox(self):
+        self.assertTrue(self.d.parse_args(["--apply", "--hot"]).hot)
+        self.assertTrue(self.d.parse_args(["--rollback", "--hot"]).hot)
+        for bad in (["--check", "--hot"], ["--apply", "--hot", "--sandbox", "/tmp/s"]):
+            with self.assertRaises(SystemExit, msg=bad):
+                self.d.main(bad)
+
+    def test_jeton_admin_transmis_par_stdin_jamais_en_argument(self):
+        rm = self.d.Remote("h", "paperclip-ac", api_token="jeton-de-test-0000")
+        done = subprocess.CompletedProcess([], 0, b'{"type":"omniroute_native","version":"1.3.1"}\n201', b"")
+        with mock.patch.object(rm, "ssh", return_value=done) as ssh:
+            out = rm.install_adapter("/paperclip/adapter-plugins/omniroute-native/releases/r2")
+        cmd, kw = ssh.call_args[0][0], ssh.call_args[1]
+        self.assertNotIn("jeton-de-test-0000", cmd)
+        self.assertIn(b"jeton-de-test-0000", kw["input_bytes"])
+        self.assertIn("/api/adapters/install", cmd)
+        self.assertEqual(out["version"], "1.3.1")
+
+    def test_json_api_transmis_par_stdin_jamais_dans_argv_curl(self):
+        body = {"adapterConfig": {"apiKey": "secret-synthetique-uniquement",
+                                  "text": 'guillemets " et barre \\ et\nligne'}}
+        for token in (None, "jeton-synthetique"):
+            with self.subTest(auth=bool(token)):
+                rm = self.d.Remote("h", "c", api_token=token)
+                done = subprocess.CompletedProcess([], 0, b'{}\n200', b"")
+                with mock.patch.object(self.d.subprocess, "run", return_value=done) as run:
+                    self.assertEqual(rm.api("POST", "/example", body), {})
+                argv = run.call_args.args[0]
+                self.assertNotIn("secret-synthetique-uniquement", str(argv))
+                self.assertNotIn(json.dumps(body), str(argv))
+                config = run.call_args.kwargs["input"].decode()
+                data_line = next(line for line in config.splitlines()
+                                 if line.startswith("data-binary = "))
+                self.assertEqual(json.loads(json.loads(data_line.split(" = ", 1)[1])), body)
+                if token:
+                    self.assertNotIn(token, str(argv))
+                    self.assertIn("Authorization: Bearer " + token, config)
+
+    def test_install_http_en_erreur(self):
+        rm = self.d.Remote("h", "c")
+        done = subprocess.CompletedProcess([], 0, b'{"error":"Instance admin access required"}\n403', b"")
+        with mock.patch.object(rm, "ssh", return_value=done):
+            with self.assertRaises(RuntimeError) as ctx:
+                rm.install_adapter("/paperclip/adapter-plugins/omniroute-native/releases/r2")
+        self.assertIn("403", str(ctx.exception))
+        self.assertEqual(ctx.exception.status, 403)
+
+    def test_test_environment_avec_la_config_de_l_agent(self):
+        rm = self.d.Remote("h", "paperclip-ac", api_token="jeton-de-test-0000")
+        agent = subprocess.CompletedProcess([], 0, b'{"adapterConfig":{"model":"AC-x"}}\n200', b"")
+        tested = subprocess.CompletedProcess([], 0, b'{"adapterType":"omniroute_native","checks":[]}\n200', b"")
+        with mock.patch.object(rm, "ssh", side_effect=[agent, tested]) as ssh:
+            out = rm.test_environment("c-1", "a-1")
+        first, second = ssh.call_args_list[0][0][0], ssh.call_args_list[1][0][0]
+        self.assertIn("/api/agents/a-1", first)
+        self.assertIn("/api/companies/c-1/adapters/omniroute_native/test-environment", second)
+        config = ssh.call_args_list[1][1]["input_bytes"].decode()
+        data_line = next(line for line in config.splitlines() if line.startswith("data-binary = "))
+        body = json.loads(json.loads(data_line.split(" = ", 1)[1]))
+        self.assertEqual(body["agentId"], "a-1")
+        self.assertEqual(body["adapterConfig"]["model"], "AC-x")
+        self.assertNotIn("jeton-de-test-0000", second)
+        self.assertEqual(out["adapterType"], "omniroute_native")
+
+    def test_options_du_code_servi(self):
+        a = self.d.parse_args(["--apply", "--hot", "--served-company", "c-1", "--expect-served", "x"])
+        self.assertEqual((a.served_company, a.served_agent, a.expect_served), ("c-1", None, "x"))
+        for bad in (["--apply", "--hot", "--expect-served", "x"],
+                    ["--apply", "--hot", "--served-company", "c 1"],
+                    ["--apply", "--served-company", "c-1"]):
+            with self.assertRaises(SystemExit, msg=bad), \
+                    mock.patch("sys.stderr", new_callable=io.StringIO):
+                self.d.parse_args(bad)
 
 
 class ContainerTmpTests(unittest.TestCase):

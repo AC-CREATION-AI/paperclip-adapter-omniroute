@@ -64,7 +64,13 @@ export interface OmniRouteConfig {
   /** `null` quand aucune clé n'est configurée — l'appel échouera proprement. */
   apiKey: string | null;
   /** D'où vient la clé, pour le diagnostic. Jamais la clé elle-même. */
-  apiKeySource: 'config' | 'env:OMNIROUTE_API_KEY' | 'env:ANTHROPIC_API_KEY' | 'none';
+  apiKeySource:
+    | 'config'
+    | 'env(agent):OMNIROUTE_API_KEY'
+    | 'env(agent):ANTHROPIC_API_KEY'
+    | 'env:OMNIROUTE_API_KEY'
+    | 'env:ANTHROPIC_API_KEY'
+    | 'none';
   model: string;
   /** Modèle de repli si le modèle principal est introuvable côté passerelle. */
   fallbackModel: string | null;
@@ -143,16 +149,38 @@ function asOptionalPositiveInt(value: unknown): number | undefined {
   return undefined;
 }
 
+/**
+ * Variable de `config.env` de l'agent.
+ *
+ * Paperclip y résout les `secret_ref` avant l'exécution (chaîne, ou liaison
+ * `{ type: 'plain', value }`). Une référence encore non résolue n'est jamais
+ * lue : ce n'est pas une clé.
+ */
+function agentEnvString(config: RawConfig, key: string): string | null {
+  const env = config.env;
+  if (!env || typeof env !== 'object' || Array.isArray(env)) return null;
+  const value = (env as Record<string, unknown>)[key];
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    const binding = value as Record<string, unknown>;
+    return binding.type === 'plain' ? asString(binding.value) : null;
+  }
+  return asString(value);
+}
+
 /** Retire les `/` de fin : `…/v1` + `/v1/messages` ferait une URL invalide. */
 export function normalizeBaseUrl(raw: string): string {
   return raw.replace(/\/+$/, '');
 }
 
 /**
- * Résout la configuration. Précédence : config explicite → variables
- * d'environnement → défauts de l'agence.
+ * Résout la configuration. Précédence : config explicite → `config.env` de
+ * l'agent → variables d'environnement du serveur → défauts de l'agence.
  *
- * `ANTHROPIC_API_KEY` est acceptée en dernier recours parce que c'est la
+ * `config.env` vient avant le serveur (ACC-3037) : c'est là que Paperclip
+ * résout le `secret_ref` de l'agent, et le conteneur `paperclip-ac` ne porte
+ * volontairement aucune clé.
+ *
+ * `ANTHROPIC_API_KEY` est acceptée après `OMNIROUTE_API_KEY` parce que c'est la
  * variable que les instances Paperclip de l'agence positionnent déjà pour
  * router vers OmniRoute : sans ce repli, un agent migré depuis `claude_local`
  * devrait dupliquer sa clé dans la config de l'adaptateur.
@@ -183,8 +211,13 @@ export function isRedactedValue(value: string): boolean {
 export function resolveConfig(config: RawConfig): OmniRouteConfig {
   const configuredApiKey =
     asString(config.apiKey) ?? asString(config.api_key) ?? asString(config.token);
-  const envOmniRouteKey = asString(process.env['OMNIROUTE_API_KEY']);
-  const envAnthropicKey = asString(process.env['ANTHROPIC_API_KEY']);
+  const keyCandidates: Array<[string | null, OmniRouteConfig['apiKeySource']]> = [
+    [configuredApiKey, 'config'],
+    [agentEnvString(config, 'OMNIROUTE_API_KEY'), 'env(agent):OMNIROUTE_API_KEY'],
+    [agentEnvString(config, 'ANTHROPIC_API_KEY'), 'env(agent):ANTHROPIC_API_KEY'],
+    [asString(process.env['OMNIROUTE_API_KEY']), 'env:OMNIROUTE_API_KEY'],
+    [asString(process.env['ANTHROPIC_API_KEY']), 'env:ANTHROPIC_API_KEY'],
+  ];
 
   let apiKey: string | null = null;
   let apiKeySource: OmniRouteConfig['apiKeySource'] = 'none';
@@ -192,21 +225,22 @@ export function resolveConfig(config: RawConfig): OmniRouteConfig {
   // réinjecte quand un champ secret n'est pas déclaré comme tel dans le
   // schéma de l'adaptateur. L'envoyer à la passerelle ne peut qu'échouer,
   // et surtout cela masque la clé d'environnement valide.
-  if (configuredApiKey && !isRedactedValue(configuredApiKey)) {
-    apiKey = configuredApiKey;
-    apiKeySource = 'config';
-  } else if (envOmniRouteKey && !isRedactedValue(envOmniRouteKey)) {
-    apiKey = envOmniRouteKey;
-    apiKeySource = 'env:OMNIROUTE_API_KEY';
-  } else if (envAnthropicKey && !isRedactedValue(envAnthropicKey)) {
-    apiKey = envAnthropicKey;
-    apiKeySource = 'env:ANTHROPIC_API_KEY';
+  for (const [candidate, source] of keyCandidates) {
+    if (candidate && !isRedactedValue(candidate)) {
+      apiKey = candidate;
+      apiKeySource = source;
+      break;
+    }
   }
 
-  const configuredBaseUrl =
-    asString(config.baseUrl) ?? asString(config.base_url) ?? asString(process.env['OMNIROUTE_BASE_URL']);
   const baseUrl = normalizeBaseUrl(
-    configuredBaseUrl ?? asString(process.env['ANTHROPIC_BASE_URL']) ?? DEFAULT_BASE_URL,
+    asString(config.baseUrl) ??
+      asString(config.base_url) ??
+      agentEnvString(config, 'OMNIROUTE_BASE_URL') ??
+      agentEnvString(config, 'ANTHROPIC_BASE_URL') ??
+      asString(process.env['OMNIROUTE_BASE_URL']) ??
+      asString(process.env['ANTHROPIC_BASE_URL']) ??
+      DEFAULT_BASE_URL,
   );
 
   const timeoutSec = asPositiveInt(config.timeoutSec, DEFAULT_TIMEOUT_SEC);

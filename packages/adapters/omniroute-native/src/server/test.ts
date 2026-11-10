@@ -39,9 +39,9 @@ export async function testEnvironment(
       level: 'error',
       message: 'Aucune clé d’API OmniRoute',
       detail:
-        'Ni `apiKey` dans la config, ni OMNIROUTE_API_KEY, ni ANTHROPIC_API_KEY ne sont définis.',
+        'Ni `apiKey` dans la config, ni OMNIROUTE_API_KEY / ANTHROPIC_API_KEY dans les variables de l’agent (`env`) ou du serveur ne sont définis.',
       hint:
-        'Renseignez `apiKey` dans la configuration de l’adaptateur, ou posez OMNIROUTE_API_KEY dans l’environnement du serveur. OmniRoute exige `Authorization: Bearer` : une clé passée en `x-api-key` est refusée avec un 401.',
+        'Liez un secret à ANTHROPIC_API_KEY (ou OMNIROUTE_API_KEY) dans les variables d’environnement de l’agent, ou renseignez `apiKey` dans la configuration de l’adaptateur. OmniRoute exige `Authorization: Bearer` : une clé passée en `x-api-key` est refusée avec un 401.',
     });
     return result(checks);
   }

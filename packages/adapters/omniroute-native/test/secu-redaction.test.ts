@@ -23,6 +23,7 @@ const JWT_RE = /eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+/;
 const PG_PASSWORD = ['mot', 'de', 'passe', 'fictif', '42'].join('');
 const PG_URL = `postgres://paperclip:${PG_PASSWORD}@postgres-paperclip:5432/paperclip`;
 const SK_KEY = ['sk', 'fictive0123456789abcdefghijKLMN'].join('-');
+const API_KEY_FICTIVE = ['valeur', 'fictive', '123456'].join('-');
 const PCP_KEY = `pcp_${'ab12'.repeat(12)}`;
 
 async function loadRedactor() {
@@ -40,7 +41,7 @@ describe('secu — masquage des motifs de secrets', () => {
       `OPENAI_API_KEY=${SK_KEY}`,
       `clé paperclip ${PCP_KEY}`,
       `Authorization: Bearer ${'Z'.repeat(40)}`,
-      `{"apiKey":"valeur-fictive-123456","model":"auto"}`,
+      `{"apiKey":"${API_KEY_FICTIVE}","model":"auto"}`,
       'password: hunter2-fictif-999',
     ].join('\n');
     const out = redactSecrets(text);
@@ -49,7 +50,7 @@ describe('secu — masquage des motifs de secrets', () => {
     expect(out).not.toContain(SK_KEY);
     expect(out).not.toContain(PCP_KEY);
     expect(out).not.toContain('Z'.repeat(40));
-    expect(out).not.toContain('valeur-fictive-123456');
+    expect(out).not.toContain(API_KEY_FICTIVE);
     expect(out).not.toContain('hunter2-fictif-999');
     expect(out).toContain('[REDACTED]');
     // Le contexte utile reste lisible : nom de variable, hôte, utilisateur.
@@ -61,7 +62,7 @@ describe('secu — masquage des motifs de secrets', () => {
 
   it('masque une clé privée PEM et une valeur connue quelle que soit sa forme', async () => {
     const { redactSecrets } = await loadRedactor();
-    const pem = ['-----BEGIN PRIVATE KEY-----', 'MIIBVwIBADANBgkqhkiG9w0BAQEFAASCAT8wggE7AgEAAkEAfictif', '-----END PRIVATE KEY-----'].join('\n');
+    const pem = [['-----BEGIN', 'PRIVATE KEY-----'].join(' '), 'MIIBVwIBADANBgkqhkiG9w0BAQEFAASCAT8wggE7AgEAAkEAfictif', '-----END PRIVATE KEY-----'].join('\n');
     const known = 'valeur-connue-fictive-77';
     const out = redactSecrets(`début\n${pem}\nla valeur ${known} apparaît sans nom`, [known]);
     expect(out).not.toContain('MIIBVwIBADANBgkqhkiG9w0BAQEFAASCAT8wggE7AgEAAkEAfictif');

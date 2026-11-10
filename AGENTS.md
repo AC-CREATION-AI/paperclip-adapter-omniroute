@@ -75,6 +75,7 @@ Tous les fichiers sources vivent sous `packages/adapters/omniroute-native/src/` 
 | `shared/client.ts` | Client HTTP/SSE vers OmniRoute, surveillance anti-figeage (`StreamWatchdog`). |
 | `shared/chat-completions.ts` | Conversion de fil de messages vers OpenAI, normalisation du cache Paperclip. |
 | `shared/context-window.ts` | Gestion dynamique de la fenêtre de contexte selon le modèle résolu et découverte de métadonnées. |
+| `shared/context-budget.ts` | Fenêtre du run lue à OmniRoute (`/v1/models/{id}`, modèle et `fallbackModel`, minimum ; repli 200 000), cache 10 min, exposée dans `resultJson.contextWindow`. |
 | `shared/pricing.ts` | Barème tarifaire officiel OmniRoute et calcul du coût estimé. |
 
 ---
