@@ -16,11 +16,19 @@ describe('Lot 4 — Parité hôte et optimisations passerelle', () => {
   });
 
   it('émet executionRecovery: { kind: bootstrap, providerWorkStarted: false } si pas de clé API', async () => {
+    // Hermétique : une clé dans l'environnement du processus de test ferait
+    // partir l'appel vers la passerelle par défaut.
+    vi.stubEnv('OMNIROUTE_API_KEY', '');
+    vi.stubEnv('ANTHROPIC_API_KEY', '');
     const { ctx } = makeTestContext({ config: { apiKey: '' } });
-    const result = await execute(ctx as never);
-    expect(result.exitCode).toBe(1);
-    expect(result.errorCode).toBe('omniroute_auth_rejected');
-    expect(result.executionRecovery).toEqual({ kind: 'bootstrap', providerWorkStarted: false });
+    try {
+      const result = await execute(ctx as never);
+      expect(result.exitCode).toBe(1);
+      expect(result.errorCode).toBe('omniroute_auth_rejected');
+      expect(result.executionRecovery).toEqual({ kind: 'bootstrap', providerWorkStarted: false });
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it('émet executionRecovery: { kind: bootstrap, providerWorkStarted: false } si workspace manquant', async () => {

@@ -26,7 +26,7 @@ première bascule.
 | `build-artifact.sh` | construit `omniroute-native-<sha7>.tar.gz` (dist + node_modules de production, sans lien externe, archive reproductible) |
 | `verify-artifact.mjs` | refuse un artefact non autonome : lien qui sort du paquet, module résolu hors du paquet, contrat du plugin-loader, versions différentes du lockfile |
 | `real-loader-probe.mjs` | exécute le **vrai** chargeur du serveur (`/app/server/dist/adapters/registry.js`) dans le conteneur, sur le registre d'un `PAPERCLIP_HOME` donné |
-| `omniroute_native_deploy.py` | essai à blanc (par défaut), `--apply`, `--rollback`, `--check` |
+| `omniroute_native_deploy.py` | essai à blanc (par défaut), `--apply`, `--rollback`, `--check` ; `--hot` sans redémarrage |
 | `tests/` | `python3 -m unittest discover -s deploy/tests` |
 
 ## Construire l'artefact
@@ -99,8 +99,118 @@ Ordre d'exécution, avec arrêt au premier échec :
 Une mise à jour suit la même commande avec un nouvel artefact : seuls `releases/` et
 `current` changent.
 
+Hôte cible : `--host` (SSH), `--container`, `--host-home` (le `PAPERCLIP_HOME` du
+conteneur vu depuis l'hôte) et `--backup-root`, ou les variables `PAPERCLIP_SSH_HOST`,
+`PAPERCLIP_CONTAINER`, `PAPERCLIP_HOST_HOME` et `PAPERCLIP_BACKUP_ROOT`. Exemple pour une
+seconde instance :
+
+```bash
+python3 deploy/omniroute_native_deploy.py --apply --hot --host root@<hôte> \
+  --container paperclip-ac --host-home <appdata>/paperclip-ac --backup-root <sauvegardes> \
+  --artifact deploy/out/omniroute-native-<sha7>.tar.gz --report deploy/out/hot-<date>.json
+```
+
 Rétention : les anciennes versions restent dans `releases/`. On les supprime à la main,
-jamais celle pointée par `current`.
+jamais celle pointée par `current`, ni celle que vise le registre.
+
+## Mise à jour à chaud, sans redémarrage (exception)
+
+À réserver au cas où le redémarrage n'est pas acceptable (runs d'autres adaptateurs en
+cours, par exemple). Cette procédure a été appliquée pour la 1.3.1 (ACC-3037).
+
+**Ne pas faire** : basculer `current`, puis `POST /api/adapters/omniroute_native/reload`.
+La route répond avec la nouvelle version, lue dans le `package.json` sur le disque, mais
+le serveur continue d'exécuter l'ancien code. Le `?t=` du réimport ne change que l'URL
+du module d'entrée. Le chemin réel résolu pour le lien et les sous-modules
+(`dist/server/test.js`, `dist/shared/config.js`…) restent en cache. Voir « Pourquoi un
+redémarrage » plus bas.
+
+**Faire** : installer le chemin **versionné** de la nouvelle version, jamais `current`.
+C'est ce que fait `--apply --hot` (et `--rollback --hot`) :
+
+```bash
+python3 deploy/omniroute_native_deploy.py --dry-run --hot --artifact <…>.tar.gz   # plan, blocages
+python3 deploy/omniroute_native_deploy.py --apply --hot --artifact <…>.tar.gz \
+  [--admin-token-file <fichier>] \
+  --served-company <société> [--served-agent <agent>] [--expect-served <révision>] \
+  --report deploy/out/hot-<date>.json
+python3 deploy/omniroute_native_deploy.py --rollback --hot          # version précédente, à chaud
+```
+
+- Seuls les runs `omniroute_native` doivent être terminés ; ceux des autres adaptateurs
+  continuent.
+- Le jeton d'administrateur d'instance est lu dans `--admin-token-file` et transmis à
+  `curl` par l'entrée standard, jamais en argument ni dans le compte rendu. Sans jeton,
+  la route n'est acceptée qu'en accès local implicite.
+- Contrôles après l'install : type et version annoncés, registre sur le chemin
+  versionné, `GET /api/adapters/omniroute_native`, sonde du vrai chargeur sur le
+  registre réel. En cas d'échec, `current` reprend sa cible et la version précédente
+  est réinstallée à chaud.
+- La version annoncée est lue sur le disque : elle ne prouve pas le code servi. Avec
+  `--served-company`, le script appelle aussi
+  `POST /api/companies/<société>/adapters/omniroute_native/test-environment`, qui
+  exécute le code réellement chargé (avec l'`adapterConfig` de `--served-agent` s'il
+  est donné). `--expect-served` exige la révision exacte dans la preuve loadedCode de la
+  réponse (étape 3 ci-dessous) ; sinon, retour arrière. Sans `--served-company`, le
+  compte rendu porte « code servi non vérifié ».
+- Install refusé en 401/403 (jeton absent ou non administrateur) : le serveur n'a rien
+  chargé ni réécrit. Le script remet seulement `current` sur sa cible, sans retour
+  arrière à chaud (il serait refusé de même), et le message indique `--admin-token-file`.
+- `--check` accepte un registre qui vise `current` ou la version vers laquelle pointe
+  `current`.
+
+Étapes équivalentes à la main :
+
+1. Copier et vérifier la version, comme aux étapes 2 et 3 de `--apply` : sauvegarde du
+   registre, extraction dans `releases/<stamp>-<sha7>`, puis
+   `node deploy/verify-artifact.mjs --lock pnpm-lock.yaml <dossier>`, qui doit renvoyer 0.
+   Basculer `current` sur ce dossier pour le prochain redémarrage.
+2. Compte administrateur d'instance. Le jeton passe par l'entrée standard (`-H @-`),
+   jamais en argument :
+   ```bash
+   printf 'Authorization: Bearer %s\n' "$(cat <fichier-jeton>)" |
+     curl -s -X POST -H @- -H 'Content-Type: application/json' \
+     -d '{"packageName":"/paperclip/adapter-plugins/omniroute-native/releases/<stamp>-<sha7>","isLocalPath":true}' \
+     "$PAPERCLIP_API_BASE/api/adapters/install"
+   ```
+   Une réponse 401 ou 403 signifie que le jeton manque ou n'est pas celui d'un
+   administrateur d'instance : rien n'a été chargé.
+   Le chemin est nouveau : toutes les URL de modules sont donc nouvelles et le code est
+   chargé depuis le disque. La route réenregistre l'adaptateur immédiatement.
+   `requiresRestart: true` dans la réponse n'est qu'indicatif.
+3. **Validation du code servi bloquée avec l'API actuelle.** Un texte commun tel que
+   `Source : env(agent):ANTHROPIC_API_KEY` ne prouve aucune révision. `--expect-served`
+   désigne désormais une révision exacte, jamais une sous-chaîne de diagnostic.
+   `--served-company` exige une attestation `loadedCode` dans test-environment :
+   `revision`, `moduleRoots` (racine versionnée attendue unique), `moduleFiles`
+   (liste non vide de chemins réels normalisés sous cette racine).
+   Petit contrat serveur nécessaire : capturer ces valeurs à l'import effectif des
+   modules de l'adaptateur dans le processus vivant, les lier à l'instance appelée,
+   et conserver la révision issue du build chargé. Ne pas relire package.json,
+   BUILD-INFO ou le registre sur disque au moment du contrôle. Une sonde Node neuve
+   ne prouve que le prochain chargement, jamais la RAM du serveur actuel.
+   Ce contrat n'est PAS implémenté ici : l'API actuelle est refusée, sans succès
+   cosmétique. Sans `--served-company`, le résultat reste explicitement non vérifié,
+   et ne constitue pas une recette du code servi.
+   `status: fail` ou inconnu bloque ; `warn` est consigné comme avertissement.
+   Un rollback refusé en 401/403 restaure `current` à son état avant tentative :
+   registre et RAM restent inchangés. Aucun retour à l'ancienne version au prochain
+   boot n'est promis. Si la restauration échoue, le rapport conserve l'erreur initiale
+   et signale une divergence ; une intervention est requise.
+   Les blancs en début et fin du fichier du jeton (dont LF/CR final) sont retirés ;
+   tout caractère de contrôle restant à l'intérieur du jeton est refusé.
+
+4. Au prochain redémarrage planifié, `--apply` (étape 5) réécrit le registre pour qu'il
+   vise de nouveau `current`.
+
+Limites :
+- `install` écrit le registre sans renommage atomique. D'où la sauvegarde de l'étape 1.
+- Un chemin déjà chargé une fois dans ce processus est resservi depuis le cache. Une
+  version reconstruite à la même place ne peut donc pas être chargée à chaud. Il faut
+  toujours un nouveau dossier `releases/<stamp>-<sha7>`.
+- Retour arrière à chaud : `install` sur le dossier de la version précédente. Ce dossier
+  a déjà été chargé, et donc resservi depuis le cache, ce qui convient pour un retour à
+  l'identique. Si un doute subsiste, redémarrer avec `--rollback`.
 
 ## Retour arrière
 
@@ -181,7 +291,14 @@ ne convient pas ici, pour trois raisons mesurées dans le code et à blanc :
 - **Droits.** La route exige un compte administrateur d'instance (`assertInstanceAdmin`).
 
 `POST /api/adapters/install` (chemin local) écrit le registre sans renommage atomique et
-répond `requiresRestart: true` lors d'une réinstallation. Il n'est donc pas utilisé.
+répond `requiresRestart: true` lors d'une réinstallation. Il n'est donc pas utilisé par
+`--apply`. Il sert seulement pour la mise à jour à chaud décrite plus haut, sur un chemin
+versionné jamais chargé auparavant.
+
+Correctif possible côté serveur (amont, hors de ce dépôt) : dans `reloadExternalAdapter`,
+importer depuis `fs.realpathSync(packageDir)` plutôt que depuis `packageDir`. Après une
+bascule de `current`, l'entrée et tous ses sous-modules auraient alors de nouvelles URL,
+et `reload` sur `current` suffirait.
 
 Le redémarrage interrompt tous les adaptateurs. C'est pour cela que le script refuse de
 s'exécuter tant qu'un run est actif.

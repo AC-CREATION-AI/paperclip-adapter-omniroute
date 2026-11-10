@@ -161,7 +161,7 @@ describe('A4/A11 — chaque appel d outil garde son résultat', () => {
 
 describe('A9 — une session corrompue ne fait pas tomber le run', () => {
   it('blocs invalides écartés au chargement', async () => {
-    await fs.writeFile(sessionFilePath(outer, 'corrupt'), JSON.stringify({ messages: [
+    await fs.writeFile(sessionFilePath(outer, 'corrupt'), JSON.stringify({ version: 1, sessionId: 'corrupt', messages: [
       { role: 'assistant', content: [null] },
       { role: 'user', content: [{ type: 'text', text: 'valide' }] },
       { role: 'assistant', content: [{ type: 'tool_use', id: 1, name: 'x' }] },

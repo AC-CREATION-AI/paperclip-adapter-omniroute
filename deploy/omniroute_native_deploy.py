@@ -25,6 +25,18 @@ Modes (un seul à la fois) :
   --rollback  restaure le registre et `current` du dernier état sauvegardé (ou
               --state), redémarre, contrôle.
 
+Avec --hot (--apply ou --rollback) : AUCUN redémarrage. Après la bascule de `current`,
+le script appelle `POST /api/adapters/install` sur le chemin VERSIONNÉ
+`releases/<…>` (jamais `current`) : chemin neuf, donc modules neufs. Le serveur
+réécrit lui-même le registre ; seuls les runs omniroute_native doivent être finis.
+Compte administrateur d'instance : --admin-token-file, ou accès local implicite ; un
+refus 401/403 ne remet que `current` en place (le serveur n'a rien chargé).
+--served-company [--served-agent] [--expect-served] : contrôle du code SERVI par
+test-environment, la version annoncée n'étant lue que sur le disque.
+
+Hôte cible : --host / --container / --host-home / --backup-root (ou variables
+PAPERCLIP_SSH_HOST, PAPERCLIP_CONTAINER, PAPERCLIP_HOST_HOME, PAPERCLIP_BACKUP_ROOT).
+
 Pourquoi un redémarrage et pas `POST /api/adapters/omniroute_native/reload` :
 le serveur garde le registre EN MÉMOIRE (adapter-plugin-store.ts, storeCache).
 Après réécriture du fichier, la route de rechargement relirait l'ANCIEN chemin et
@@ -56,17 +68,21 @@ import time
 
 ADAPTER_TYPE = "omniroute_native"
 HOST = os.environ.get("PAPERCLIP_SSH_HOST", "root@localhost")
-CONTAINER = "paperclip"
+CONTAINER = os.environ.get("PAPERCLIP_CONTAINER", "paperclip")
 CT_HOME = "/paperclip"                       # PAPERCLIP_HOME dans le conteneur
 HOST_HOME = os.environ.get("PAPERCLIP_HOST_HOME", "/var/lib/paperclip")
 BACKUP_ROOT = os.environ.get("PAPERCLIP_BACKUP_ROOT", "/var/backups/paperclip")
 INSTALL_REL = "adapter-plugins/omniroute-native"
 REGISTRY_REL = "adapter-plugins.json"
-HEALTH_URL = "http://127.0.0.1:3100/api/health"
+API_URL = "http://127.0.0.1:3100/api"
+HEALTH_URL = f"{API_URL}/health"
 TSX_LOADER = "./server/node_modules/tsx/dist/loader.mjs"
 HERE = pathlib.Path(__file__).resolve().parent
 ACTIVE_RUNS_SQL = ("select count(*) from heartbeat_runs "
                    "where status in ('running','queued','starting')")
+ACTIVE_NATIVE_RUNS_SQL = ("select count(*) from heartbeat_runs r join agents a on a.id = r.agent_id "
+                          "where r.status in ('running','queued','starting') "
+                          f"and a.adapter_type = '{ADAPTER_TYPE}'")
 
 
 # ─── Fonctions pures (testées par deploy/tests/test_deploy.py) ──────────────
@@ -97,7 +113,7 @@ def serialize_registry(records):
 
 def parse_loader_logs(text):
     """Extrait des journaux pino du serveur ce que le chargeur a fait."""
-    info = {"package_dirs": [], "loaded_types": [], "failures": []}
+    info = {"package_dirs": [], "loaded_types": [], "failures": [], "installed": []}
     for line in text.splitlines():
         line = line.strip()
         if not line.startswith("{"):
@@ -113,6 +129,9 @@ def parse_loader_logs(text):
             info["loaded_types"].extend(rec.get("adapters") or [])
         elif msg.startswith("Failed to dynamically load external adapter"):
             info["failures"].append(rec.get("packageName") or rec.get("type") or "?")
+        elif msg == "External adapter installed and registered":   # POST /api/adapters/install
+            info["installed"].append(rec.get("packageName"))
+            info["loaded_types"].append(rec.get("type"))
     return info
 
 
@@ -124,8 +143,9 @@ def post_check_errors(info, adapter_type, expected_dir):
     if adapter_type not in info["loaded_types"]:
         errs.append(f"{adapter_type} absent de « Loaded external adapters » : "
                     "les agents retomberaient sur l'adaptateur process")
-    if expected_dir not in info["package_dirs"]:
-        errs.append(f"aucun chargement depuis {expected_dir} (vus : {info['package_dirs']})")
+    if expected_dir not in info["package_dirs"] + info["installed"]:
+        errs.append(f"aucun chargement depuis {expected_dir} (vus : "
+                    f"{info['package_dirs'] + info['installed']})")
     return errs
 
 
@@ -149,6 +169,76 @@ def content_digest(tar_bytes, root="omniroute-native"):
     return hashlib.sha256(manifest).hexdigest()
 
 
+def hot_rollback_target(previous, install):
+    """Chemin à réinstaller à chaud : la version visée par l'ancien `current` (chemin
+    versionné, jamais `current` lui-même), sinon l'ancien localPath tel quel."""
+    local, cur = previous.get("localPath"), previous.get("current")
+    if cur and local in (f"{install}/current", f"{install}/{cur}"):
+        return f"{install}/{cur}"
+    return local
+
+
+def served_check_errors(resp, expect=None, expected_dir=None):
+    """Fail closed : la réponse actuelle ne prouve pas les imports du serveur vivant.
+
+    loadedCode est un contrat requis, pas une capacité annoncée de l'API actuelle.
+    Une sonde dans un processus neuf ne peut pas remplacer cette attestation.
+    """
+    errs = []
+    if resp.get("adapterType") != ADAPTER_TYPE:
+        errs.append("code servi : mauvais adapterType")
+    if resp.get("status") not in ("pass", "warn"):
+        errs.append("code servi : test-environment en échec ou statut absent")
+    if not isinstance(resp.get("checks"), list) or not resp["checks"]:
+        errs.append("code servi : aucun contrôle")
+    proof = resp.get("loadedCode")
+    if not expected_dir or not isinstance(proof, dict):
+        errs.append("code servi : preuve des modules chargés/révision attendue absente ; "
+                    "contrat API loadedCode requis (un marqueur textuel ne suffit pas)")
+        return errs
+    if not proof.get("revision"):
+        errs.append("code servi : révision absente de loadedCode")
+    elif expect and proof.get("revision") != expect:
+        errs.append("code servi : révision chargée différente")
+    root = posixpath.normpath(expected_dir)
+    roots, files = proof.get("moduleRoots"), proof.get("moduleFiles")
+    if (not isinstance(roots, list) or roots != [root] or
+            not isinstance(files, list) or not files or
+            any(not isinstance(f, str) or not f.startswith(root + "/") or
+                posixpath.normpath(f) != f for f in files)):
+        errs.append("code servi : modules/racines hors version attendue ou absents")
+    return errs
+
+
+def validate_token(token):
+    if token is not None:
+        token = token.strip()
+        if any(ord(c) < 32 or ord(c) == 127 for c in token):
+            raise ValueError("jeton administrateur : caractères de contrôle interdits")
+    return token
+
+
+def guarded_restore_current(rm, previous, stamp, checks):
+    try:
+        restore_current(rm, previous, stamp)
+        checks["currentRestored"] = True
+        return True
+    except Exception as exc:
+        checks["errors"].append(f"restauration current : {type(exc).__name__}: {exc}")
+        checks["divergence"] = "RAM/registre inchangés après refus install ; current divergent ou inconnu"
+        checks["currentRestored"] = False
+        return False
+
+
+def auth_refused(exc):
+    """Refus d'authentification de l'API : rien n'a été chargé ni réécrit côté serveur."""
+    return isinstance(exc, ApiError) and exc.status in (401, 403)
+
+
+AUTH_HINT = ("compte administrateur d'instance requis : --admin-token-file <fichier> "
+             "(ou accès local implicite)")
+
+
 def release_id(stamp, git_sha):
     return f"{stamp}-{git_sha[:7]}"
 
@@ -167,6 +257,7 @@ def latest_state(names):
 
 
 SAFE_PATH = re.compile(r"/[A-Za-z0-9/_.-]*")
+SAFE_ID = re.compile(r"[A-Za-z0-9_-]+")
 
 
 def check_safe_path(path, what="chemin"):
@@ -198,8 +289,24 @@ def parse_args(argv):
                       help="lecture seule : le serveur en service a-t-il chargé l'adaptateur ?")
     p.set_defaults(mode="dry-run")
     p.add_argument("--artifact", help="omniroute-native-<sha7>.tar.gz (défaut : construit)")
+    p.add_argument("--hot", action="store_true",
+                   help="--apply/--rollback sans redémarrage : POST /api/adapters/install "
+                        "sur le chemin versionné (voir deploy/README.md)")
+    p.add_argument("--admin-token-file",
+                   help="--hot : fichier local contenant un jeton d'administrateur d'instance "
+                        "(transmis par stdin, jamais affiché)")
+    p.add_argument("--served-company", metavar="ID_SOCIETE",
+                   help="--hot : contrôler le code SERVI par POST /api/companies/<id>/adapters/"
+                        "omniroute_native/test-environment après l'install")
+    p.add_argument("--served-agent", metavar="ID_AGENT",
+                   help="--hot : agent omniroute_native dont l'adapterConfig sert au contrôle")
+    p.add_argument("--expect-served", metavar="REVISION",
+                   help="--hot : révision exacte attendue dans la preuve loadedCode du serveur vivant")
     p.add_argument("--host", default=HOST)
     p.add_argument("--container", default=CONTAINER)
+    p.add_argument("--host-home", default=HOST_HOME,
+                   help="PAPERCLIP_HOME du conteneur vu depuis l'hôte (sauvegardes)")
+    p.add_argument("--backup-root", default=BACKUP_ROOT, help="dossier des sauvegardes sur l'hôte")
     p.add_argument("--container-tmp", default="/tmp/omniroute-native-dryrun",
                    help="préfixe des copies jetables dans le conteneur (sous /tmp/)")
     p.add_argument("--state", help="--rollback : nom du fichier d'état (défaut : le dernier)")
@@ -213,10 +320,43 @@ def parse_args(argv):
     p.add_argument("--sandbox", metavar="/tmp/DOSSIER",
                    help="essai à blanc de --apply/--rollback/--check dans un bac à sable sous "
                         "/tmp du conteneur (vrai chargeur, aucun redémarrage ; voir SandboxRemote)")
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if args.hot and args.mode == "check":
+        p.error("--hot ne s'applique qu'à --apply, --rollback ou à l'essai à blanc")
+    if args.hot and args.sandbox:
+        p.error("--hot appelle l'API du serveur en service : incompatible avec --sandbox")
+    if (args.served_company or args.served_agent or args.expect_served) and not args.hot:
+        p.error("--served-company/--served-agent/--expect-served ne s'appliquent qu'avec --hot")
+    if (args.served_agent or args.expect_served) and not args.served_company:
+        p.error("--served-agent/--expect-served exigent --served-company")
+    for opt in ("served_company", "served_agent"):
+        value = getattr(args, opt)
+        if value is not None and not SAFE_ID.fullmatch(value):
+            p.error(f"--{opt.replace('_', '-')} : caractères autorisés [A-Za-z0-9_-] seulement")
+    return args
+
+
+def served_options(args, expect=True):
+    """Contrôle du code servi demandé en ligne de commande (None : non demandé)."""
+    if not args.served_company:
+        return None
+    return {"company": args.served_company, "agent": args.served_agent,
+            "expect": args.expect_served if expect else None}
 
 
 # ─── Accès distant ──────────────────────────────────────────────────────────
+
+class ApiError(RuntimeError):
+    """Réponse HTTP non 2xx de l'API Paperclip (`status` : code HTTP, 0 si illisible)."""
+
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
+
+
+class InstallAuthRefused(ApiError):
+    """Refus 401/403 du POST install lui-même, avant les contrôles post-mutation."""
+
 
 class Remote:
     """Accès au serveur : `ssh` sur l'hôte distant, `ct` dans le conteneur.
@@ -227,8 +367,11 @@ class Remote:
     """
 
     def __init__(self, host, container, tmp_prefix="/tmp/omniroute-native-dryrun", *,
-                 ct_home=CT_HOME, host_home=HOST_HOME, backup_root=BACKUP_ROOT):
+                 ct_home=CT_HOME, host_home=HOST_HOME, backup_root=BACKUP_ROOT, api_token=None):
         self.host_name, self.container = host, container
+        if not isinstance(container, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", container):
+            raise ValueError("container : identifiant Docker invalide")
+        self.api_token = validate_token(api_token)
         self.tmp_prefix = check_safe_path(tmp_prefix, "tmp_prefix")
         self.ct_home = check_safe_path(ct_home, "ct_home")
         self.host_home = check_safe_path(host_home, "host_home")
@@ -245,7 +388,7 @@ class Remote:
 
     def ct(self, script, *, user="node", input_bytes=None, check=True, timeout=300):
         """Script sh dans le conteneur (stdin transmis grâce à -i)."""
-        cmd = (f"docker exec -i -u {user} {self.container} sh -c "
+        cmd = (f"docker exec -i -u {shlex.quote(user)} {shlex.quote(self.container)} sh -c "
                + shlex.quote(script))
         return self.ssh(cmd, input_bytes=input_bytes, check=check, timeout=timeout)
 
@@ -261,22 +404,65 @@ class Remote:
         return self.out(self.ssh("date -u +%Y-%m-%dT%H:%M:%SZ")).strip()
 
     def started_at(self):
-        return self.out(self.ssh(f"docker inspect -f '{{{{.State.StartedAt}}}}' {self.container}")).strip()
+        return self.out(self.ssh(f"docker inspect -f '{{{{.State.StartedAt}}}}' {shlex.quote(self.container)}")).strip()
 
     def restart(self):
-        self.ssh(f"docker restart {self.container}", timeout=240)
+        self.ssh(f"docker restart {shlex.quote(self.container)}", timeout=240)
 
     def server_logs(self, since):
-        return self.out(self.ssh(f"docker logs --since {since} {self.container} 2>&1", timeout=120))
+        return self.out(self.ssh(f"docker logs --since {shlex.quote(since)} {shlex.quote(self.container)} 2>&1", timeout=120))
 
     def health(self):
         return self.out(self.ct(f"curl -s -o /dev/null -w '%{{http_code}}' {HEALTH_URL}",
                                 check=False, timeout=30)).strip()
 
-    def active_runs_raw(self):
+    def active_runs_raw(self, sql=ACTIVE_RUNS_SQL):
         return self.out(self.ct(
             "PGOPTIONS='-c default_transaction_read_only=on' psql \"$DATABASE_URL\" -Atc "
-            + shlex.quote(ACTIVE_RUNS_SQL), check=False))
+            + shlex.quote(sql), check=False))
+
+    def active_native_runs_raw(self):
+        return self.active_runs_raw(ACTIVE_NATIVE_RUNS_SQL)
+
+    def api(self, method, path, body=None):
+        """Appel de l'API du serveur depuis le conteneur. Corps et jeton passent par
+        une configuration curl sur stdin, jamais par argv ni un fichier temporaire."""
+        validate_token(self.api_token)
+        cmd = f"curl -s -w '\\n%{{http_code}}' -X {method}"
+        config = []
+        if body is not None:
+            config.append('header = "Content-Type: application/json"')
+            config.append("data-binary = " + json.dumps(json.dumps(body)))
+        if self.api_token:
+            config.append("header = " + json.dumps(f"Authorization: Bearer {self.api_token}"))
+        stdin = None
+        if config:
+            cmd += " --config -"
+            stdin = ("\n".join(config) + "\n").encode()
+        r = self.ct(f"{cmd} {API_URL}{path}", input_bytes=stdin, check=False, timeout=180)
+        text, _, code = self.out(r).rstrip("\n").rpartition("\n")
+        if not code.startswith("2"):
+            raise ApiError(int(code) if code.isdigit() else 0,
+                           f"{method} /api{path} : HTTP {code or '?'} {text[:300]}")
+        return json.loads(text)
+
+    def install_adapter(self, path):
+        """POST /api/adapters/install en chemin local : importe et réenregistre à chaud."""
+        return self.api("POST", "/adapters/install",
+                        {"packageName": check_safe_path(path), "isLocalPath": True})
+
+    def adapter_info(self):
+        return self.api("GET", f"/adapters/{ADAPTER_TYPE}")
+
+    def test_environment(self, company, agent=None):
+        """testEnvironment du code SERVI, avec l'adapterConfig de l'agent s'il est donné
+        (le serveur restaure lui-même les valeurs d'env masquées)."""
+        body = {"adapterConfig": {}}
+        if agent:
+            cfg = self.api("GET", f"/agents/{agent}").get("adapterConfig")
+            body = {"adapterConfig": cfg if isinstance(cfg, dict) else {}, "agentId": agent}
+        return self.api("POST", f"/companies/{company}/adapters/{ADAPTER_TYPE}/test-environment",
+                        body)
 
 
 class SandboxRemote(Remote):
@@ -311,7 +497,7 @@ class SandboxRemote(Remote):
     def host(self, cmd, **kw):
         return self.ct(cmd, **kw)
 
-    def active_runs_raw(self):
+    def active_runs_raw(self, sql=ACTIVE_RUNS_SQL):
         return "0"
 
     def health(self):
@@ -386,8 +572,13 @@ def ensure_artifact(path):
 def read_state(rm):
     reg_path = f"{rm.ct_home}/{REGISTRY_REL}"
     raw = rm.ct(f"cat {reg_path}").stdout
-    records = json.loads(raw.decode("utf-8"))
-    rec = next((r for r in records if r.get("type") == ADAPTER_TYPE), None)
+    try:
+        records = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        records = []
+    if not isinstance(records, list):
+        records = []
+    rec = next((r for r in records if isinstance(r, dict) and r.get("type") == ADAPTER_TYPE), None)
     local = rec.get("localPath") if rec else None
     exists = None
     if local:
@@ -504,6 +695,15 @@ def switch_current(rm, target_rel, stamp):
     return rm.out(rm.ct(f"readlink {install}/current")).strip()
 
 
+def restore_current(rm, previous, stamp):
+    """Remet `current` sur sa cible d'avant (ou le retire s'il n'existait pas)."""
+    if previous:
+        log("   current -> " + switch_current(rm, previous, stamp))
+    else:
+        rm.ct(f"rm -f {rm.ct_home}/{INSTALL_REL}/current")
+        log("   current retiré (absent avant le déploiement)")
+
+
 def restart_and_wait(rm):
     since = rm.utc_now()
     log("== redémarrage du conteneur (docker restart)")
@@ -529,11 +729,70 @@ def post_checks(rm, since, expected_dir, release_dir, catalogue=True, strict=Tru
     return {"serverLogs": info, "probe": probe, "errors": errs}
 
 
+def hot_install_and_check(rm, target, release_dir, version=None, catalogue=True, served=None):
+    """--hot : install du chemin versionné sur le serveur en service, puis contrôles.
+
+    Le serveur doit annoncer le type (et la version attendue), viser `target` dans le
+    registre qu'il vient de réécrire, et un chargeur neuf doit trouver tous les modules
+    dans `release_dir` (ce que chargerait le prochain redémarrage). Avec `served`
+    (served_options), test-environment contrôle en plus le code réellement servi."""
+    log(f"   POST /api/adapters/install {target}")
+    try:
+        resp = rm.install_adapter(target)
+    except ApiError as exc:
+        if auth_refused(exc):
+            raise InstallAuthRefused(exc.status, str(exc)) from exc
+        raise
+    errs = []
+    if resp.get("type") != ADAPTER_TYPE:
+        errs.append(f"install : type {resp.get('type')!r} au lieu de {ADAPTER_TYPE}")
+    if version and resp.get("version") != version:
+        errs.append(f"install : version {resp.get('version')!r} au lieu de {version}")
+    st = read_state(rm)
+    if st["localPath"] != target:
+        errs.append(f"registre sur {st['localPath']} au lieu de {target}")
+    info = rm.adapter_info()
+    if version and info.get("version") != version:
+        errs.append(f"GET /api/adapters/{ADAPTER_TYPE} : version {info.get('version')!r}")
+    strict = target.startswith(f"{rm.ct_home}/{INSTALL_REL}/")
+    probe = run_probe(rm, rm.ct_home, expect_dir=release_dir if strict else None,
+                      catalogue=catalogue, allow_real_home=True,
+                      forbid="agency-starter" if strict else None)
+    if not probe.get("ok"):
+        errs.extend(f"sonde : {e}" for e in probe.get("errors", []))
+    checks = {"install": resp, "adapter": info, "probe": probe, "errors": errs}
+    if served:
+        tested = rm.test_environment(served["company"], served["agent"])
+        checks["served"] = tested
+        errs.extend(served_check_errors(tested, served["expect"], release_dir))
+        if tested.get("status") == "warn":
+            checks.setdefault("warnings", []).append("test-environment : statut warn")
+    else:
+        checks["warnings"] = ["code servi non vérifié : sans --served-company, seuls la version "
+                              "annoncée (lue sur le disque) et la sonde sont contrôlées"]
+    return checks
+
+
+def check_active_runs(st, rm, hot):
+    """À froid, le redémarrage coupe tous les runs ; à chaud, seuls ceux de l'adaptateur."""
+    if not hot:
+        if st["active_runs"] is None or st["active_runs"] > 0:
+            raise SystemExit(f"runs actifs : {st['active_runs']} — attendre qu'ils finissent")
+        return
+    raw = rm.active_native_runs_raw().strip()
+    try:
+        native = parse_active_runs(raw)
+    except ValueError as exc:
+        raise SystemExit(f"runs {ADAPTER_TYPE} actifs : {exc}")
+    if native > 0:
+        raise SystemExit(f"runs {ADAPTER_TYPE} actifs : {native} — attendre qu'ils finissent")
+
+
 def apply(rm, args, art, st, report):
+    hot = args.hot
     if art["build"].get("dirty") and not args.allow_dirty:
         raise SystemExit("artefact construit avec des modifications non commitées (--allow-dirty)")
-    if st["active_runs"] is None or st["active_runs"] > 0:
-        raise SystemExit(f"runs actifs : {st['active_runs']} — attendre qu'ils finissent")
+    check_active_runs(st, rm, hot)
     if st["health"] != "200":
         raise SystemExit(f"API non saine avant déploiement (HTTP {st['health']})")
 
@@ -565,7 +824,7 @@ def apply(rm, args, art, st, report):
     if reg_backup_sha != st["registry_sha256"] or count < 2:
         raise SystemExit("sauvegarde incohérente (registre ou archive) — abandon, rien n'a été écrit")
     state = {
-        "stamp": stamp, "type": ADAPTER_TYPE,
+        "stamp": stamp, "type": ADAPTER_TYPE, "mode": "hot" if hot else "restart",
         "artifact": {"sha256": art["sha256"], "contentSha256": art["contentSha256"],
                      "gitCommit": art["build"]["gitCommit"],
                      "file": pathlib.Path(art["path"]).name},
@@ -573,7 +832,7 @@ def apply(rm, args, art, st, report):
                    "registry": backup_reg, "registrySha256": reg_backup_sha},
         "previous": {"localPath": old_local, "current": st["current"],
                      "registrySha256": st["registry_sha256"]},
-        "new": {"localPath": current_path, "release": f"releases/{rid}"},
+        "new": {"localPath": rel_dir if hot else current_path, "release": f"releases/{rid}"},
     }
     state_name = f"omniroute-native-lot14-{stamp}.state.json"
     rm.host(f"cat > {backup_root}/{state_name}",
@@ -601,22 +860,43 @@ def apply(rm, args, art, st, report):
         log("== 3. bascule atomique de current")
         log("   current -> " + switch_current(rm, f"releases/{rid}", stamp))
 
-        log("== 4. registre (temporaire + rename)")
-        if old_local == current_path:
-            log("   déjà sur …/current : inchangé")
+        if hot:
+            # Le serveur réécrit lui-même le registre (le sien est en mémoire) : pas
+            # d'écriture ici. Le prochain --apply à froid le remet sur current.
+            log("== 4. installation à chaud du chemin versionné (aucun redémarrage)")
+            checks = hot_install_and_check(rm, rel_dir, rel_dir, art["version"],
+                                           catalogue=not args.skip_catalogue,
+                                           served=served_options(args))
         else:
-            text = serialize_registry(new_registry(
-                st["records"], ADAPTER_TYPE, current_path, art["version"],
-                dt.datetime.now(dt.timezone.utc).isoformat(timespec="milliseconds")
-                .replace("+00:00", "Z")))
-            log("   sha256=" + write_registry_atomic(rm, text, st["registry_sha256"], stamp))
+            log("== 4. registre (temporaire + rename)")
+            if old_local == current_path:
+                log("   déjà sur …/current : inchangé")
+            else:
+                text = serialize_registry(new_registry(
+                    st["records"], ADAPTER_TYPE, current_path, art["version"],
+                    dt.datetime.now(dt.timezone.utc).isoformat(timespec="milliseconds")
+                    .replace("+00:00", "Z")))
+                log("   sha256=" + write_registry_atomic(rm, text, st["registry_sha256"], stamp))
 
-        since = restart_and_wait(rm)
-        log("== 5. contrôles après")
-        checks = post_checks(rm, since, current_path, rel_dir, catalogue=not args.skip_catalogue)
+            since = restart_and_wait(rm)
+            log("== 5. contrôles après")
+            checks = post_checks(rm, since, current_path, rel_dir, catalogue=not args.skip_catalogue)
         print_checks(checks)
     except Exception as exc:  # noqa: BLE001 — tout échec après la bascule
         log(f"   ÉCHEC après la bascule : {type(exc).__name__}: {str(exc)[:300]}")
+        if hot and isinstance(exc, InstallAuthRefused):
+            # Refus d'authentification : le serveur n'a rien chargé ni réécrit. Seul
+            # `current` a changé ; un install de retour arrière serait refusé de même.
+            report["postChecks"] = {"errors": [str(exc)], "authRefused": exc.status}
+            restoration = guarded_restore_current(rm, st["current"], stamp,
+                                                  report["postChecks"])
+            if not restoration:
+                raise SystemExit(f"INSTALL REFUSÉ HTTP {exc.status} ; restauration current en échec ; "
+                                 "RAM/registre inchangés, current divergent ou inconnu ; intervention requise") from None
+            raise SystemExit(
+                f"INSTALL À CHAUD REFUSÉ (HTTP {exc.status}) : {AUTH_HINT}. Le serveur sert "
+                f"toujours la version précédente ; current remis sur {st['current']} ; "
+                "aucun retour arrière nécessaire.") from None
         checks = {"errors": [f"exception après la bascule : {type(exc).__name__}: {exc}"]}
     report["postChecks"] = checks
     if checks["errors"]:
@@ -625,16 +905,28 @@ def apply(rm, args, art, st, report):
         log("== ÉCHEC APRÈS LA BASCULE → retour arrière automatique")
         rollback(rm, args, state_name, report, force=True)
         raise SystemExit(1)
-    log(f"DÉPLOYÉ : {ADAPTER_TYPE} chargé depuis {current_path} -> releases/{rid}")
+    log(f"DÉPLOYÉ{' À CHAUD' if hot else ''} : {ADAPTER_TYPE} chargé depuis "
+        + (rel_dir if hot else f"{current_path} -> releases/{rid}"))
 
 
 def print_checks(checks):
-    s = checks["serverLogs"]
-    log(f"   journaux serveur : chargés={s['loaded_types']} depuis={s['package_dirs']} "
-        f"échecs={s['failures']}")
-    p = checks["probe"]
+    s = checks.get("serverLogs")
+    if s:
+        log(f"   journaux serveur : chargés={s['loaded_types']} depuis={s['package_dirs']} "
+            f"install={s.get('installed')} échecs={s['failures']}")
+    if "install" in checks:
+        i, a = checks["install"], checks["adapter"]
+        log(f"   install : type={i.get('type')} version={i.get('version')} — servi : "
+            f"version={a.get('version')} source={a.get('source')}")
+    p = checks.get("probe", {})
     log(f"   sonde : ok={p.get('ok')} type={p.get('effectiveAdapterType')} "
         f"modules={p.get('adapterModuleFiles')} catalogue={p.get('catalogue')}")
+    if "served" in checks:
+        t = checks["served"]
+        log(f"   code servi (test-environment) : type={t.get('adapterType')} "
+            f"statut={t.get('status')} contrôles={len(t.get('checks') or [])}")
+    for w in checks.get("warnings", []):
+        log(f"   ATTENTION {w}")
     if catalogue_degraded(p.get("catalogue")):
         log("   ATTENTION catalogue de secours (OmniRoute /v1/models lent ou en 503) : "
             "non bloquant, l'adaptateur est chargé")
@@ -652,12 +944,21 @@ def rollback(rm, args, state_name, report, force=False):
         raise SystemExit(f"nom d'état inattendu : {state_name!r}")
     state = json.loads(rm.host(f"cat {rm.backup_root}/{state_name}").stdout)
     st = read_state(rm)
-    if not force and not args.ignore_active_runs and (st["active_runs"] or 0) > 0:
-        raise SystemExit(f"runs actifs : {st['active_runs']} (--ignore-active-runs pour forcer)")
+    if not force and not args.ignore_active_runs:
+        if args.hot:
+            check_active_runs(st, rm, hot=True)
+        elif (st["active_runs"] or 0) > 0:
+            raise SystemExit(f"runs actifs : {st['active_runs']} (--ignore-active-runs pour forcer)")
     stamp = now_stamp()
     prev = state["previous"]
     ct_home = rm.ct_home
-    log(f"== retour arrière vers l'état {state_name}")
+    hot_target = hot_rollback_target(prev, f"{ct_home}/{INSTALL_REL}")
+    # Ancien registre sur `current` alors qu'aucun `current` n'était posé : rien à réinstaller.
+    if args.hot and (not hot_target or (hot_target == f"{ct_home}/{INSTALL_REL}/current"
+                                        and not prev["current"])):
+        raise SystemExit("ancienne version absente de l'état sauvegardé : retour arrière à chaud "
+                         "sans version de repli — utiliser --rollback sans --hot ou intervenir")
+    log(f"== retour arrière{' à chaud' if args.hot else ''} vers l'état {state_name}")
 
     reg = rm.host(f"cat {shlex.quote(state['backup']['registry'])}").stdout
     if sha256_bytes(reg) != state["backup"]["registrySha256"]:
@@ -673,6 +974,31 @@ def rollback(rm, args, state_name, report, force=False):
                 f"{shlex.quote(member)}", timeout=600)
     if prev["current"]:
         log("   current -> " + switch_current(rm, prev["current"], stamp))
+    if args.hot:
+        install = f"{ct_home}/{INSTALL_REL}"
+        target = hot_target
+        release_dir = (f"{install}/{prev['current']}"
+                       if prev["current"] and target.startswith(install + "/") else target)
+        try:
+            checks = hot_install_and_check(rm, target, release_dir, catalogue=not args.skip_catalogue,
+                                           served=served_options(args, expect=False))
+        except InstallAuthRefused as exc:
+            report["rollbackChecks"] = {"errors": [str(exc)], "authRefused": exc.status}
+            guarded_restore_current(rm, st["current"], stamp, report["rollbackChecks"])
+            raise SystemExit(
+                f"RETOUR ARRIÈRE À CHAUD REFUSÉ (HTTP {exc.status}) : {AUTH_HINT}. Le serveur "
+                "sert toujours la version installée ; registre inchangé ; restauration de current "
+                "vers son état avant tentative consignée dans rollbackChecks. Aucun repli garanti "
+                "au prochain boot — relancer avec le jeton, ou --rollback sans --hot.") from None
+        except Exception as exc:  # noqa: BLE001 — install potentiellement déjà effectué
+            checks = {"errors": [f"exception après install : {type(exc).__name__}: {exc}"]}
+        report["rollbackChecks"] = checks
+        print_checks(checks)
+        if checks["errors"]:
+            raise SystemExit("RETOUR ARRIÈRE À CHAUD : contrôles en échec — --rollback sans --hot "
+                             "(redémarrage) ou intervention manuelle")
+        log(f"RETOUR ARRIÈRE À CHAUD OK : {ADAPTER_TYPE} chargé depuis {target}")
+        return
     if sha256_bytes(st["registry_raw"]) != sha256_bytes(reg):
         log("   registre restauré sha256=" + write_registry_atomic(
             rm, reg.decode("utf-8"), st["registry_sha256"], stamp))
@@ -699,31 +1025,40 @@ def check(rm, args, report):
     if not expected:
         log(f"   ÉCHEC aucune entrée {ADAPTER_TYPE} dans le registre : agents sur process")
         return 1
-    dedicated = expected == f"{rm.ct_home}/{INSTALL_REL}/current" and st["current"]
-    release_dir = f"{rm.ct_home}/{INSTALL_REL}/{st['current']}" if dedicated else expected
+    install = f"{rm.ct_home}/{INSTALL_REL}"
+    # Après une mise à jour --hot, le registre vise releases/<…> = la cible de current.
+    dedicated = st["current"] and expected in (f"{install}/current", f"{install}/{st['current']}")
+    release_dir = f"{install}/{st['current']}" if dedicated else expected
     checks = post_checks(rm, st["startedAt"], expected, release_dir,
                          catalogue=not args.skip_catalogue, strict=bool(dedicated))
     if not dedicated:
         checks["warnings"] = [f"installation hors chemin dédié ({expected}) : "
                               "un nettoyage du dépôt qui la contient la supprime"]
-        log("   ATTENTION " + checks["warnings"][0])
     report["check"] = checks
     print_checks(checks)
     log("CHECK " + ("OK" if not checks["errors"] else "ÉCHEC"))
     return 0 if not checks["errors"] else 1
 
 
+def make_remote(args):
+    if args.sandbox:
+        return SandboxRemote(args.host, args.container, args.sandbox)
+    token = None
+    if args.admin_token_file:
+        token = validate_token(pathlib.Path(args.admin_token_file).read_text().strip() or None)
+    return Remote(args.host, args.container, check_container_tmp(args.container_tmp),
+                  host_home=args.host_home, backup_root=args.backup_root, api_token=token)
+
+
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
     tmp_prefix = check_container_tmp(args.container_tmp)
+    rm = make_remote(args)
     if args.sandbox:
-        rm = SandboxRemote(args.host, args.container, args.sandbox)
         tmp_prefix = rm.tmp_prefix
         if rm.ct(f"test -f {rm.ct_home}/{REGISTRY_REL}", check=False).returncode:
             raise SystemExit(f"bac à sable : {rm.ct_home}/{REGISTRY_REL} absent (à préparer)")
         log(f"== BAC À SABLE {rm.root} (PAPERCLIP_HOME={rm.ct_home}) : production non touchée")
-    else:
-        rm = Remote(args.host, args.container, tmp_prefix)
     report = {"mode": args.mode, "sandbox": args.sandbox,
               "at": dt.datetime.now(dt.timezone.utc).isoformat()}
     try:
@@ -767,11 +1102,26 @@ def main(argv=None):
                 f"(+ adapter-plugins.json.<stamp>, état .state.json)")
             log(f"   2. {rm.ct_home}/{INSTALL_REL}/releases/{rid}")
             log(f"   3. current -> releases/{rid}")
-            log(f"   4. registre localPath : {st['localPath']} -> {rm.ct_home}/{INSTALL_REL}/current")
-            log("   5. docker restart paperclip, puis contrôles (journaux du chargeur, sonde, catalogue)")
             blockers = []
-            if st["active_runs"] is None or st["active_runs"] > 0:
-                blockers.append(f"runs actifs : {st['active_runs']}")
+            if args.hot:
+                log(f"   4. POST /api/adapters/install {rm.ct_home}/{INSTALL_REL}/releases/{rid} "
+                    "(aucun redémarrage), puis contrôles (réponse, registre, version servie, sonde)")
+                served = served_options(args)
+                log("   5. code servi : " + (
+                    f"test-environment société {served['company']}"
+                    + (f", agent {served['agent']}" if served["agent"] else "")
+                    + (f", révision attendue {served['expect']!r}" if served["expect"] else "")
+                    if served else "NON VÉRIFIÉ (--served-company absent)"))
+                try:
+                    check_active_runs(st, rm, hot=True)
+                except SystemExit as exc:
+                    blockers.append(str(exc.code))
+            else:
+                log(f"   4. registre localPath : {st['localPath']} -> {rm.ct_home}/{INSTALL_REL}/current")
+                log(f"   5. docker restart {rm.container}, puis contrôles (journaux du chargeur, "
+                    "sonde, catalogue)")
+                if st["active_runs"] is None or st["active_runs"] > 0:
+                    blockers.append(f"runs actifs : {st['active_runs']}")
             if st["health"] != "200":
                 blockers.append(f"santé HTTP {st['health']}")
             if art["build"].get("dirty"):

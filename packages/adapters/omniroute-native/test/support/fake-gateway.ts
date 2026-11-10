@@ -17,6 +17,8 @@ export interface CapturedRequest {
   messages: Array<{ role: string; content: unknown }>;
   /** Noms des outils proposés. */
   tools: string[];
+  /** En-tête `Authorization` reçu (clé de test uniquement). */
+  authorization: string;
 }
 
 export interface FakeGateway {
@@ -76,6 +78,7 @@ export async function startFakeGateway(
         system: typeof system === 'string' ? system : '',
         messages: (parsed.messages ?? []).filter((m) => m.role !== 'system'),
         tools: (parsed.tools ?? []).map((t) => t.function?.name ?? '?'),
+        authorization: req.headers.authorization ?? '',
       });
 
       const modelName = options.model ?? 'auto/best-coding';

@@ -1,17 +1,18 @@
 /**
  * Borne l'historique intra-run (audit A10) pour éviter l'explosion de contexte
  * si le modèle répète des lectures volumineuses.
- * Conserve toujours le premier message (consigne) et les tours récents
+ * Conserve toujours l’objectif du run courant (consigne) et les tours récents
  * complets (assistant + réponses d'outils associées), sans jamais créer
  * d'orphelins.
  */
 export function pruneIntraRunHistory(
   messages: WireMessage[],
   budget: number = 100_000,
+  currentPromptIndex: number = 0,
 ): WireMessage[] {
-  if (messages.length <= 1) return messages;
-  const first = messages[0]!;
-  const rest = messages.slice(1);
+  if (messages.length <= 1 || messages.reduce((n, m) => n + JSON.stringify(m).length, 0) <= budget) return messages;
+  const first = messages[currentPromptIndex]!;
+  const rest = messages.slice(currentPromptIndex + 1);
 
   const turns: WireMessage[][] = [];
   let current: WireMessage[] = [];
@@ -207,9 +208,14 @@ interface AttemptResult extends Omit<AgentLoopResult, 'subtasks' | 'escalations'
   model: string;
 }
 
+type CheckpointUsage = Pick<AgentLoopResult,
+  'turns' | 'inputTokens' | 'outputTokens' | 'cacheReadTokens' | 'cacheWriteTokens' | 'costUsd' | 'costTurnsMissing'>;
+
 interface AttemptControl {
   /** Arrêter la boucle sur erreurs d'outil identiques ? (vrai seulement si une escalade est possible) */
   stopOnStuck?: (currentModel: string) => boolean;
+  /** Usage hors tentative courante, lu au moment du checkpoint uniquement. */
+  checkpointOffset?: () => CheckpointUsage;
 }
 
 /**
@@ -272,7 +278,21 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentLoop
   const attempts: AttemptResult[] = [];
   let attemptOptions: AgentLoopOptions = { ...options, tools };
   for (;;) {
-    const attempt = await runLoopAttempt(attemptOptions, { stopOnStuck: (model) => nextRung(model) !== null });
+    const attempt = await runLoopAttempt(attemptOptions, {
+      stopOnStuck: (model) => nextRung(model) !== null,
+      // Lu après les outils : childUsage peut augmenter pendant cette tentative.
+      // Les résultats de tentative restent locaux, sinon le total final doublerait l’offset.
+      checkpointOffset: () => attempts.reduce<CheckpointUsage>((total, previous) => ({
+        turns: total.turns + previous.turns,
+        inputTokens: total.inputTokens + previous.inputTokens,
+        outputTokens: total.outputTokens + previous.outputTokens,
+        cacheReadTokens: total.cacheReadTokens + previous.cacheReadTokens,
+        cacheWriteTokens: total.cacheWriteTokens + previous.cacheWriteTokens,
+        costTurnsMissing: total.costTurnsMissing + previous.costTurnsMissing,
+        costUsd: total.costUsd === null && previous.costUsd === null
+          ? null : (total.costUsd ?? 0) + (previous.costUsd ?? 0),
+      }), { ...childUsage, turns: 0 }),
+    });
     attempts.push(attempt);
     tried.add(attempt.model);
 
@@ -539,9 +559,18 @@ async function runLoopAttempt(options: AgentLoopOptions, control: AttemptControl
 
     // Point de contrôle (session + usage) : chaque appel d'outil a sa réponse.
     try {
+      const offset = control.checkpointOffset?.();
       await options.onCheckpoint?.({
-        messages: [...messages], turns, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens,
-        costUsd, costTurnsMissing, servedModel: servedModel ?? currentModel,
+        messages: [...messages],
+        turns: turns + (offset?.turns ?? 0),
+        inputTokens: inputTokens + (offset?.inputTokens ?? 0),
+        outputTokens: outputTokens + (offset?.outputTokens ?? 0),
+        cacheReadTokens: cacheReadTokens + (offset?.cacheReadTokens ?? 0),
+        cacheWriteTokens: cacheWriteTokens + (offset?.cacheWriteTokens ?? 0),
+        costUsd: costUsd === null && offset?.costUsd == null
+          ? null : (costUsd ?? 0) + (offset?.costUsd ?? 0),
+        costTurnsMissing: costTurnsMissing + (offset?.costTurnsMissing ?? 0),
+        servedModel: servedModel ?? currentModel,
       });
     } catch {
       /* un point de contrôle raté ne fait pas échouer le run */
@@ -729,7 +758,7 @@ async function streamOnce(
   let textBuffer = '';
 
   // Borner l'historique intra-run (A10 + Lot 5) selon le budget résolu
-  const outboundMessages = pruneIntraRunHistory(messages, options.intraRunBudget ?? 100_000);
+  const outboundMessages = pruneIntraRunHistory(messages, options.intraRunBudget ?? 100_000, options.history?.length ?? 0);
 
   const result = await client.streamMessage(
     {

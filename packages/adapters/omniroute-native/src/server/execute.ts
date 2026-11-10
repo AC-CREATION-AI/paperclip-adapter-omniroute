@@ -154,7 +154,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<OmniRouteEx
       signal: null,
       timedOut: false,
       errorMessage:
-        'Aucune clé API OmniRoute configurée. Renseignez `apiKey` dans la config de l’adaptateur, ou OMNIROUTE_API_KEY / ANTHROPIC_API_KEY dans l’environnement.',
+        'Aucune clé API OmniRoute configurée. Renseignez `apiKey` dans la config de l’adaptateur, ou OMNIROUTE_API_KEY / ANTHROPIC_API_KEY dans les variables de l’agent (`env`) ou du serveur.',
       errorCode: 'omniroute_auth_rejected',
       errorFamily: null,
       retryNotBefore: null,
@@ -270,6 +270,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<OmniRouteEx
   let sessionParams = session.attempt.params;
   const checkpointer = new RunCheckpointer(session, context.onUsage, warn);
   if (!session.attempt.resumed && typeof (ctx as unknown as Record<string, unknown>)['getFreshSessionHandoff'] === 'function') {
+    delete ctx.context?.['paperclipFreshSessionHandoffMarkdown'];
     try {
       const getHandoff = (ctx as unknown as { getFreshSessionHandoff: () => Promise<string | null> }).getFreshSessionHandoff;
       const handoff = await getHandoff();
@@ -438,6 +439,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<OmniRouteEx
       sessionParams = fresh.attempt.params;
       checkpointer.newAttempt();
       await warn(`historique de la session ${previousId} refusé par le modèle : essai à neuf sur la session ${sessionParams.sessionId}`);
+      delete ctx.context?.['paperclipFreshSessionHandoffMarkdown'];
       const hostHandoff = await context.getFreshSessionHandoff?.().catch(() => null);
       return runLoop(
         joinPromptSections([fresh.handoff, typeof hostHandoff === 'string' ? hostHandoff.trim() : '', buildPrompt(ctx, { resumedSession: false })]),
@@ -605,13 +607,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<OmniRouteEx
         // filtré par `NARRATION_OPENERS` et n'est pas le contrat natif.
         // Cartes de décision v1.2 : aucune finalResponse ni summary en attente humaine
         // pour ne pas polluer le fil de discussion Paperclip avec un dump JSON d'outil.
+        // Masquage (t_e8b687c2) : le texte publié passe par le même masqueur
+        // que le transcript et la session — une clé connue renvoyée par le
+        // modèle ne sort pas en clair dans le commentaire Paperclip.
         ...(result.completion === 'completed' && !result.waitingForHuman && result.finalText.trim().length > 0
           ? {
               finalResponse: {
                 disposition: 'final' as const,
-                text: result.finalText,
+                text: redact(result.finalText),
               },
-              summary: result.finalText,
+              summary: redact(result.finalText),
             }
           : {}),
       },
@@ -837,7 +842,7 @@ function buildPrompt(ctx: AdapterExecutionContext, options: { resumedSession: bo
   const freshHandoff = typeof freshHandoffRaw === 'string' ? freshHandoffRaw.trim() : '';
   const sessionHandoffNote = asString(context['paperclipSessionHandoffMarkdown'], '').trim();
 
-  const handoffSection = freshHandoff.length > 0
+  const handoffSection = options.resumedSession ? '' : freshHandoff.length > 0
     ? `## Passation de session précédente\n\n${freshHandoff}`
     : sessionHandoffNote.length > 0
       ? `## Passation de session précédente\n\n${sessionHandoffNote}`
@@ -882,7 +887,7 @@ function buildInvariantEnvironmentSection(): string {
     '- `PAPERCLIP_API_URL` : URL de base du serveur Paperclip.',
     '- `PAPERCLIP_AGENT_ID` : Identifiant de cet agent.',
     '- `PAPERCLIP_COMPANY_ID` : Identifiant de l\'organisation.',
-    '- `PAPERCLIP_HOME` : Répertoire de base de l\'agent.',
+    '- `AGENT_HOME` : Répertoire de base de l\'agent.',
     '',
     'Variables propres à chaque mission injectées dans le shell :',
     'PAPERCLIP_TASK_ID, PAPERCLIP_RUN_ID, PAPERCLIP_WAKE_REASON, PAPERCLIP_WORKSPACE_CWD.',

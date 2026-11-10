@@ -71,11 +71,19 @@ describe("contrat d'annulation — l'hôte sait que l'adaptateur respecte le sig
   });
 
   it('annonce la même chose quand la clé manque, mais reste un échec', async () => {
+    // Hermétique : une clé dans l'environnement du processus de test ferait
+    // partir l'appel vers la passerelle par défaut.
+    vi.stubEnv('OMNIROUTE_API_KEY', '');
+    vi.stubEnv('ANTHROPIC_API_KEY', '');
     const { ctx } = makeContext({ config: { apiKey: '', model: 'auto/best-coding' } });
 
-    const result = await execute(ctx as never);
+    try {
+      const result = await execute(ctx as never);
 
-    expect(result.errorCode).toBe('omniroute_auth_rejected');
-    expect(result.exitCode).toBe(1);
+      expect(result.errorCode).toBe('omniroute_auth_rejected');
+      expect(result.exitCode).toBe(1);
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 });

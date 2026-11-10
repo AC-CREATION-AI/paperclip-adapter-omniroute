@@ -1,6 +1,6 @@
 # Paperclip OmniRoute Native Adapter (`omniroute_native`)
 
-[![CI](https://github.com/ptichalouf/paperclip-adapter-omniroute/actions/workflows/ci.yml/badge.svg)](https://github.com/ptichalouf/paperclip-adapter-omniroute/actions/workflows/ci.yml)
+[![CI](https://github.com/AC-CREATION-AI/paperclip-adapter-omniroute/actions/workflows/ci.yml/badge.svg)](https://github.com/AC-CREATION-AI/paperclip-adapter-omniroute/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![AI Agent Friendly](https://img.shields.io/badge/AI%20Agent-Friendly%20(AGENTS.md)-blueviolet.svg)](./AGENTS.md)
 
@@ -30,7 +30,7 @@ Prérequis : **Node.js >=22.15** et **pnpm 9.12.0** (Python >=3.10 pour les test
 ### 1. Cloner et compiler l'adaptateur
 
 ```bash
-git clone https://github.com/ptichalouf/paperclip-adapter-omniroute.git
+git clone https://github.com/AC-CREATION-AI/paperclip-adapter-omniroute.git
 cd paperclip-adapter-omniroute
 pnpm install --frozen-lockfile --ignore-scripts
 pnpm run build
@@ -54,7 +54,7 @@ L'adaptateur peut être installé selon deux méthodes :
   {
     "packageName": "/paperclip/adapter-plugins/omniroute-native/current",
     "localPath": "/paperclip/adapter-plugins/omniroute-native/current",
-    "version": "1.3.0",
+    "version": "1.3.1",
     "type": "omniroute_native"
   }
 ]

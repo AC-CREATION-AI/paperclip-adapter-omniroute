@@ -11,8 +11,9 @@
  * - aucun `.gitignore` : dans un checkout de projet, `git add -A` les
  *   embarquerait.
  *
- * Ce module ne connaît pas le format des messages : il ne fait que des
- * opérations de fichiers sûres. `session.ts` l'utilise.
+ * Ce module ne connaît pas le format des messages ; il vérifie seulement
+ * l'enveloppe version/identité avant de muter un checkpoint. `session.ts`
+ * valide les messages et l'utilise pour les opérations de fichiers sûres.
  */
 import { randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
@@ -214,6 +215,28 @@ function scrubJsonText(raw: string): string {
   return JSON.stringify(redactJsonValue(JSON.parse(raw)));
 }
 
+/** Enveloppe disque version1 uniquement ; aucune migration implicite. */
+export function isCompatibleSessionEnvelope(value: unknown, sessionId: string): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const stored = value as Record<string, unknown>;
+  return stored['version'] === 1 && stored['sessionId'] === sessionId;
+}
+
+/** Sous verrou : conserver une enveloppe inconnue, même face à la rétention. */
+async function canMutateSessionFile(file: string, expectedId?: string): Promise<boolean> {
+  const raw = await fs.readFile(file, 'utf8');
+  let parsed: unknown;
+  try { parsed = JSON.parse(raw); } catch { return true; } // JSON tronqué : politique existante.
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return true;
+  const id = (parsed as Record<string, unknown>)['sessionId'];
+  if (typeof id === 'string' && isCompatibleSessionEnvelope(parsed, expectedId ?? id)
+    && `${id.replace(/[^A-Za-z0-9_-]/g, '_')}.json` === path.basename(file)) return true;
+  // Ne pas réécrire, renommer ni supprimer la source refusée. Seuls les droits
+  // sont resserrés, y compris pour un checkpoint incompatible déjà ancien.
+  await fs.chmod(file, 0o600);
+  return false;
+}
+
 export interface PurgeOptions {
   /** Identifiants de session à ne jamais supprimer (session courante). */
   keep?: string[];
@@ -237,15 +260,18 @@ export interface PurgeReport {
  * - supprime les temporaires d'écriture abandonnés et les verrous périmés ;
  * - repasse en `0600` (et masque) les anciens fichiers lisibles par d'autres.
  *
- * La session courante (`keep`) n'est jamais supprimée. Toute erreur sur un
- * fichier est ignorée : la purge ne doit jamais faire échouer un run.
+ * La session courante (`keep`) n'est jamais supprimée. Les enveloppes
+ * incompatibles sont conservées octet pour octet (chmod 0600 seulement).
+ * Toute erreur sur un fichier est ignorée : la purge ne doit jamais faire
+ * échouer un run.
  */
 export async function purgeSessionDir(dir: string, options: PurgeOptions = {}): Promise<PurgeReport> {
   const report: PurgeReport = { deleted: 0, scrubbed: 0, tmpRemoved: 0 };
   const now = options.now ?? Date.now();
   const ttlMs = options.ttlMs ?? SESSION_TTL_MS;
   const maxFiles = Math.max(1, options.maxFiles ?? SESSION_MAX_FILES);
-  const keep = new Set((options.keep ?? []).map((id) => `${id.replace(/[^A-Za-z0-9_-]/g, '_')}.json`));
+  const keepIds = new Map((options.keep ?? []).map((id) => [`${id.replace(/[^A-Za-z0-9_-]/g, '_')}.json`, id]));
+  const keep = new Set(keepIds.keys());
   let names: string[];
   try {
     names = await fs.readdir(dir);
@@ -295,8 +321,12 @@ export async function purgeSessionDir(dir: string, options: PurgeOptions = {}): 
   for (const name of doomed) {
     const full = path.join(dir, name);
     try {
-      await withSessionLock(full, () => fs.rm(full, { force: true }), { timeoutMs: 200 });
-      report.deleted += 1;
+      const deleted = await withSessionLock(full, async () => {
+        if (!await canMutateSessionFile(full)) return false;
+        await fs.rm(full, { force: true });
+        return true;
+      }, { timeoutMs: 200 });
+      if (deleted) report.deleted += 1;
     } catch {
       /* fichier occupé : il sera purgé au prochain passage */
     }
@@ -307,16 +337,18 @@ export async function purgeSessionDir(dir: string, options: PurgeOptions = {}): 
     if (doomed.has(session.name) || (session.mode & 0o077) === 0) continue;
     const full = path.join(dir, session.name);
     try {
-      await withSessionLock(
+      const scrubbed = await withSessionLock(
         full,
         async () => {
+          if (!await canMutateSessionFile(full, keepIds.get(session.name))) return false;
           const raw = await fs.readFile(full, 'utf8');
           const cleaned = (options.scrub ?? scrubJsonText)(raw);
           await writeFileAtomic(full, cleaned);
+          return true;
         },
         { timeoutMs: 200 },
       );
-      report.scrubbed += 1;
+      if (scrubbed) report.scrubbed += 1;
     } catch {
       await fs.chmod(full, 0o600).catch(() => undefined);
     }

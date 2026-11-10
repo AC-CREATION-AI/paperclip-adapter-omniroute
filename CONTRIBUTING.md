@@ -50,7 +50,7 @@ Ce projet accueille chaleureusement les contributions des développeurs humains 
 
 ## Signalement de vulnérabilité
 
-Pour tout problème de sécurité ou vulnérabilité suspectée, merci de **ne pas ouvrir d'issue publique**. Utilisez les [Security Advisories privés de GitHub](https://github.com/ptichalouf/paperclip-adapter-omniroute/security/advisories) pour un échange confidentiel.
+Pour tout problème de sécurité ou vulnérabilité suspectée, merci de **ne pas ouvrir d'issue publique**. Utilisez les [Security Advisories privés de GitHub](https://github.com/AC-CREATION-AI/paperclip-adapter-omniroute/security/advisories) pour un échange confidentiel.
 
 ---
 

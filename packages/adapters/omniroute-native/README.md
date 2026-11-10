@@ -44,8 +44,8 @@ l'autre serait un réglage silencieusement inopérant.
 
 | Champ | Défaut | Rôle |
 | --- | --- | --- |
-| `baseUrl` | `http://localhost:20128` | Racine de la passerelle, sans `/v1`. Repli sur `OMNIROUTE_BASE_URL` puis `ANTHROPIC_BASE_URL`. |
-| `apiKey` | — | Clé Bearer HTTP. Repli sur `OMNIROUTE_API_KEY` puis `ANTHROPIC_API_KEY`. |
+| `baseUrl` | `http://localhost:20128` | Racine de la passerelle, sans `/v1`. Repli sur `OMNIROUTE_BASE_URL` puis `ANTHROPIC_BASE_URL`, d’abord dans les variables de l’agent (`env`), puis dans celles du serveur. |
+| `apiKey` | — | Clé Bearer HTTP. Repli sur `OMNIROUTE_API_KEY` puis `ANTHROPIC_API_KEY`, d’abord dans les variables de l’agent (`env`, où Paperclip résout les `secret_ref`), puis dans celles du serveur. Une valeur masquée est ignorée. |
 | `model` | `auto/best-coding` | Identifiant avec préfixe de fournisseur (`claude/claude-sonnet-5`) ou combo `auto/*`. |
 | `fallbackModel` | — | Repli si `model` est introuvable côté passerelle. Vide = échec explicite. |
 | `reasoningEffort` | `high` | `reasoning_effort` Chat Completions : none/low/medium/high. `none` = champ omis. Relance sans en cas de refus amont. |

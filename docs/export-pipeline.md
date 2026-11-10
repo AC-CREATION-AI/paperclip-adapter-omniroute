@@ -1,69 +1,53 @@
-# Processus d'export et synchronisation Gitea → GitHub
+# Export Gitea → GitHub (D263)
 
-Ce document décrit le protocole d'exportation des modifications depuis le dépôt interne Gitea (`ac-dev-bot/ac-paperclip-adapters`) vers le dépôt public GitHub (`ptichalouf/paperclip-adapter-omniroute`).
+## Source unique et arrêt de sécurité
+Gitea est la source de développement ; GitHub est un miroir public assaini. Aucun développement ne doit être fusionné uniquement dans le miroir.
+Aucun export automatique n'est armé par cette procédure : les workflows actuels exécutent des tests, pas une publication.
+**Un export ne peut pas s'exécuter si un instantané public→interne n'a pas été fait depuis la dernière fusion publique.**
+Le verrou exécutable est `scripts/check-export.py` ; une sortie non nulle interdit toute préparation ou publication. Ne jamais contourner ce verrou en changeant seulement le manifeste.
 
----
-
-## 1. Principes et Sécurité (Décision D284)
-
-Le dépôt public GitHub est sous licence MIT et ouvert aux contributions. Aucun secret, identifiant interne ou donnée d'infrastructure privée ne doit être publié.
-
-**Interdictions formelles :**
-- Aucune adresse IP privée de réseau local (hors adresses de boucle locale).
-- Aucun chemin de système de fichiers interne (répertoires privés ou montages de stockage).
-- Aucun jeton d'instance Paperclip ni secret (fichiers d’authentification, clés API, mots de passe).
-- Aucun nom de domaine d'infrastructure privée (domaine privé personnel ou client).
-- Aucun identifiant ou nom de client interne.
-
----
-
-## 2. Étapes du processus d'export
-
-### Étape 1 : Préparation et extraction de la branche
-Extraire la branche de travail ou le commit depuis la source interne vers un répertoire de travail isolé.
-
-### Étape 2 : Nettoyage automatique et assainissement
-Appliquer les règles d'assainissement :
-1. Remplacer toute IP LAN par `http://localhost:20128` ou `127.0.0.1`.
-2. Remplacer les chemins internes et les montages de stockage par des chemins génériques (`~/.paperclip/token`, `/var/lib/paperclip`, etc.) ou des variables d'environnement (`PAPERCLIP_HOST_HOME`, `PAPERCLIP_BACKUP_ROOT`).
-3. Remplacer les UUIDs réels de sociétés, projets, objectifs ou agents par des identifiants d'exemple synthétiques (`00000000-0000-0000-0000-000000000001`, `TASK-1001`).
-4. Vérifier que la configuration d'exemple (`bench/config.json`) ne contient que des valeurs génériques.
-
-### Étape 3 : Exécution du contrôle anti-fuite
-Exécuter le script de validation anti-fuite :
-
-```bash
-bash scripts/check-anti-leak.sh
-```
-
-Le script scanne tous les fichiers suivis, y compris ses propres sources et les binaires, sans exclusion de fichier ni de dossier. Les charges synthétiques des tests sont assemblées à l’exécution : aucune exception permanente pour les fixtures. Les noms des fichiers et lignes sont signalés, jamais le contenu potentiellement sensible. Il doit renvoyer 0 ; un échec Git ou de lecture doit échouer fermé. Ce garde à motifs connus ne remplace pas la revue humaine ni un détecteur de secrets génériques.
-
-```bash
-python3 -m unittest discover -s scripts -p 'test_*.py' -v
-```
-
-### Étape 4 : Licences et validation locale complète
-
-Avant chaque export, inventorier les vrais tarballs des dépendances verrouillées (SHA-512 du lockfile = registre = octets), y compris les paquets embarqués dans `adapter-utils`. Reprendre leurs textes LICENSE/NOTICE en entier dans `THIRD_PARTY_NOTICES.md` à la racine et dans le paquet, sans inventer de copyright. Les sources immuables et empreintes originales sont consignées dans `third-party-inventory.json`. Un manifeste de sous-chemin n’est pas un nouveau paquet. Si un tarball omet sa licence, reprendre la licence du dépôt amont au commit de provenance, en documentant ce recours. Vérifier le NOTICE de `bare-path`, les avis tiers imbriqués et les licences effectivement incluses dans l’archive finale ; ne pas confondre licence déclarée et textes redistribués.
-
-Les tests Python du garde vérifient aussi les empreintes des textes et l’identité des deux notices. Conserver les espaces des textes tiers intacts (ils peuvent déclencher `git diff --check`). Aucun nouveau tag ni réécriture d’historique pendant cet export.
-Vérifier l'intégralité des tests avant tout envoi distant :
-
-```bash
-# Vérifications TypeScript et Node
+## 1. Mesurer puis importer l'instantané
+Récupérer les deux têtes fraîches dans un clone privé, avec `origin` = Gitea et `public` = GitHub.
+Avant toute écriture, sauvegarder les commits et inventorier les chemins remplacés avec leurs anciens blobs (`git ls-tree -r origin/main` et `git diff --raw origin/main public/main`).
+Annoncer le remplacement : les versions courantes anciennes sont remplacées, mais les anciens commits restent accessibles.
+Créer une branche depuis Gitea main. Importer l'arbre public exact, en conservant seulement `.gitea/` côté interne.
+Créer un commit d'instantané pur AVANT de réappliquer les changements exclusivement internes.
+Enregistrer son SHA et la tête publique dans `docs/public-snapshot.json`, dans un commit suivant.
+Le verrou vérifie l'ascendance et l'égalité des arbres : un manifeste déclaratif seul n'est pas une preuve.
+Reporter les changements internes par leur diff exact, jamais par remplacement d'un fichier entier plus récent.
+Ouvrir la PR Gitea ; fusion par merge commit pour conserver l'ascendance du snapshot (pas de squash). Pas de force-push, de tag, de changement de protection ou de fusion par l'auteur.
+## 2. Assainir et vérifier la source candidate
+Conserver MIT, les deux `LICENSE`, les deux `THIRD_PARTY_NOTICES.md` et l'inventaire des dépendances.
+Si les dépendances changent : inventorier les tarballs verrouillés (SHA-512 lockfile = registre = octets), y compris les paquets embarqués, reprendre les textes LICENSE/NOTICE complets et leurs empreintes dans `third-party-inventory.json`. Préserver le NOTICE de `bare-path`, les avis imbriqués et les espaces des textes tiers ; documenter tout recours à une licence amont au commit de provenance. `scripts/test_notices.py` contrôle la couverture et les empreintes des deux notices.
+Retirer adresses LAN, chemins internes, identifiants réels et secrets ; les exemples utilisent localhost et les UUID synthétiques de `bench/config.json`.
+Exécuter exactement :
+```sh
 pnpm install --frozen-lockfile --ignore-scripts
 pnpm run typecheck
 pnpm run build
 pnpm run test
 pnpm --filter @agence/omniroute-native run verify
-
-# Suites de banc et de déploiement hors ligne
+bash scripts/check-anti-leak.sh
+python3 -m unittest discover -s scripts -p 'test_*.py' -v
 python3 -m unittest discover -s bench -q
 python3 -m unittest discover -s deploy/tests -q
 ```
-
-### Étape 5 : Publication et revue
-1. Pousser la branche de travail nettoyée sur le dépôt public GitHub.
-2. Ouvrir une Pull Request avec la description détaillée et la preuve des tests.
-3. Attendre la validation de la CI GitHub Actions (qui exécute automatiquement `scripts/check-anti-leak.sh` et les suites de tests).
-4. Soumettre à la revue (`qa_reviewer`) avant toute fusion dans `main`.
+Le scanner de marqueurs n'est pas un détecteur universel de secrets : ajouter `gitleaks dir --redact --no-banner .` dans l'arbre exporté et relire les exemples.
+## 3. Rejouer sans publication, puis ouvrir UNE PR publique
+Fixer `SOURCE` au SHA candidat Gitea et `PUBLIC` au SHA fraîchement récupéré du miroir ; ne jamais employer une tête cachée obsolète.
+```sh
+git fetch --no-tags public main
+python3 scripts/check-export.py "$SOURCE" "$PUBLIC"
+test ! -e "$EXPORT_DIR"
+git worktree add --detach "$EXPORT_DIR" "$PUBLIC"
+git -C "$EXPORT_DIR" restore --source "$SOURCE" --staged --worktree -- . ':(exclude).gitea'
+git -C "$EXPORT_DIR" diff --cached --name-status
+```
+La projection exclut uniquement `.gitea/`. Le verrou exige zéro fichier public effacé et zéro marqueur interne ; il interroge lui-même la tête publique en direct.
+Rejouer les tests et scanners dans cette projection. Enregistrer commandes, sorties, SHA et diff exact, pas seulement un compteur de fichiers.
+Créer un commit public dont le parent est `PUBLIC`, sans importer l'historique privé, puis pousser une nouvelle branche et ouvrir une seule PR avec le diff exact en description.
+Préparer en brouillon tant que la PR source n'est pas fusionnée et que les revues requises au head exact ne sont pas acquises.
+Relancer le verrou juste avant toute poussée ; si la tête publique a bougé, STOP et nouvel instantané.
+La publication automatique éventuelle doit employer le même verrou avant tout accès aux identifiants d'écriture, puis les portes de tests, anti-fuite et revue. Elle reste désarmée jusqu'à preuve sans perte et validation humaine.
+Après la fusion publique, le manifeste devient volontairement périmé : l'export suivant reste bloqué jusqu'au prochain instantané.
+Aucune réécriture d'historique, aucun nouveau tag et aucune fusion sans APPROVE A (et B si requis) au head exact.
