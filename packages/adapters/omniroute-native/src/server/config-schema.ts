@@ -104,7 +104,7 @@ export const configSchema: AdapterConfigSchema = {
       key: 'maxContextChars',
       label: 'Budget de contexte (caractères)',
       type: 'number',
-      hint: 'Taille maximale en caractères de l’historique transmis au modèle. Laisser vide pour un dimensionnement automatique selon le modèle.',
+      hint: 'Taille maximale en caractères de l’historique transmis au modèle. Laisser vide : dimensionné d’après la fenêtre lue à OmniRoute au début du run (modèle et repli, la plus petite ; 200 000 tokens si inconnue).',
       group: 'Modèle',
     },
     {
@@ -112,6 +112,7 @@ export const configSchema: AdapterConfigSchema = {
       label: 'Tokens de sortie par tour',
       type: 'number',
       default: DEFAULT_MAX_TOKENS,
+      hint: 'Borné au run par le max_output_tokens qu’OmniRoute annonce pour le modèle et son repli.',
       group: 'Modèle',
     },
     {

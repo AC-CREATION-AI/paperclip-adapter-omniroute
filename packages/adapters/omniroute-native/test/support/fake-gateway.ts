@@ -19,6 +19,8 @@ export interface CapturedRequest {
   tools: string[];
   /** En-tête `Authorization` reçu (clé de test uniquement). */
   authorization: string;
+  /** `max_tokens` demandé. */
+  maxTokens?: number;
 }
 
 export interface FakeGateway {
@@ -44,6 +46,8 @@ export interface FakeGatewayOptions {
   model?: string;
   /** Compteurs de tokens renvoyés dans le chunk d'usage final. */
   usage?: { prompt_tokens?: number; completion_tokens?: number };
+  /** Fiches renvoyées par `GET /v1/models/{id}` (fenêtre de contexte, ACC-3085). */
+  modelCatalog?: Record<string, unknown>;
 }
 
 /** Démarre une fausse passerelle OmniRoute. */
@@ -54,6 +58,12 @@ export async function startFakeGateway(
 
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     if (req.method === 'GET' && req.url?.startsWith('/v1/models')) {
+      const entry = options.modelCatalog?.[decodeURIComponent(req.url.slice('/v1/models/'.length))];
+      if (entry) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(entry));
+        return;
+      }
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ data: [{ id: 'auto/best-coding' }] }));
       return;
@@ -67,6 +77,7 @@ export async function startFakeGateway(
       let parsed: {
         messages?: Array<{ role: string; content: unknown }>;
         tools?: Array<{ function?: { name?: string } }>;
+        max_tokens?: number;
       } = {};
       try {
         parsed = JSON.parse(body);
@@ -79,6 +90,7 @@ export async function startFakeGateway(
         messages: (parsed.messages ?? []).filter((m) => m.role !== 'system'),
         tools: (parsed.tools ?? []).map((t) => t.function?.name ?? '?'),
         authorization: req.headers.authorization ?? '',
+        ...(typeof parsed.max_tokens === 'number' ? { maxTokens: parsed.max_tokens } : {}),
       });
 
       const modelName = options.model ?? 'auto/best-coding';

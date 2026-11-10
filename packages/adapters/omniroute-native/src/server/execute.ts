@@ -69,7 +69,8 @@ import {
   type SkillMount,
 } from './skills.js';
 import { resolveHistoryBudgetChars, resolveIntraRunBudgetChars } from './session.js';
-import { calculateDynamicSessionBudgets, loadRemoteModelContext } from '../shared/context-window.js';
+import { calculateDynamicSessionBudgets } from '../shared/context-window.js';
+import { loadContextBudget } from '../shared/context-budget.js';
 import { isHistoryRejection, openRunSession, RunCheckpointer, startFreshAttempt } from './session-run.js';
 import { collectSecretValues, createRedactor, guardToolOutputs, redactJsonValue } from './secrets-redact.js';
 import type { WireMessage } from '../shared/wire.js';
@@ -247,21 +248,33 @@ export async function execute(ctx: AdapterExecutionContext): Promise<OmniRouteEx
   // forme d'historique rejoué devant le modèle (dossier stable et privé,
   // écriture atomique sous verrou, purge : voir `session-run.ts`).
   const endEnsureSession = startPhase(ctx.onEvent, 'ensure_session');
-  const contextSpec = await loadRemoteModelContext(
-    config.baseUrl,
-    config.apiKey ?? '',
-    config.model,
+  // ACC-3085 — fenêtre lue à OmniRoute (modèle et repli), jamais écrite à la main.
+  const contextBudget = await loadContextBudget({
+    baseUrl: config.baseUrl,
+    apiKey: config.apiKey ?? '',
+    model: config.model,
+    fallbackModel: config.fallbackModel,
     signal,
-  );
-  const { historyBudgetChars, intraRunBudgetChars } = calculateDynamicSessionBudgets(
-    contextSpec.contextTokens,
-  );
-  const historyBudget = typeof config.maxContextChars === 'number' && config.maxContextChars > 0
+  });
+  const { historyBudgetChars, intraRunBudgetChars } = calculateDynamicSessionBudgets(contextBudget.tokens);
+  const manualChars = typeof config.maxContextChars === 'number' && config.maxContextChars > 0
     ? config.maxContextChars
-    : historyBudgetChars;
-  const intraRunBudget = typeof config.maxContextChars === 'number' && config.maxContextChars > 0
-    ? config.maxContextChars
-    : intraRunBudgetChars;
+    : null;
+  const historyBudget = manualChars ?? historyBudgetChars;
+  const intraRunBudget = manualChars ?? intraRunBudgetChars;
+  const maxTokens = contextBudget.maxOutputTokens !== null
+    ? Math.min(config.maxTokens, contextBudget.maxOutputTokens)
+    : config.maxTokens;
+  const contextWindow = {
+    ...contextBudget,
+    source: manualChars !== null ? 'config' as const : contextBudget.source,
+    historyBudgetChars: historyBudget,
+    intraRunBudgetChars: intraRunBudget,
+  };
+  await log(
+    'stdout',
+    `[omniroute_native] fenêtre de contexte ${contextWindow.tokens} tokens (source ${contextWindow.source} ; ${contextBudget.models.map((m) => `${m.id} ${m.tokens ?? 'inconnue'}`).join(', ')}) · sortie max ${maxTokens}`,
+  );
   const session = await openRunSession({
     context: ctx.context, runtime: ctx.runtime, workspaceCwd, historyBudget, redact,
     log: (text) => log('stdout', text), warn,
@@ -406,7 +419,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<OmniRouteEx
       initialUserMessage,
       history,
       tools: guardToolOutputs(tools, redact),
-      maxTokens: config.maxTokens,
+      maxTokens,
       reasoningEffort: config.reasoningEffort,
       cacheControlPoints: config.cacheControlPoints,
       sessionId: sessionParams.sessionId,
@@ -500,6 +513,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<OmniRouteEx
         durationMs: Date.now() - started,
         cacheWriteTokens: result.cacheWriteTokens,
         gatewayHeaders: result.gatewayHeaders,
+        contextWindow,
         ...delegationResultFields(result),
       };
       return cancelled;
@@ -513,7 +527,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<OmniRouteEx
         exitCode: 1,
         signal: null,
         timedOut: false,
-        errorMessage: `Réponse coupée par la limite de sortie (maxTokens=${config.maxTokens}) malgré ${MAX_LENGTH_CONTINUATIONS} relance(s) : rien n'est publié.`,
+        errorMessage: `Réponse coupée par la limite de sortie (maxTokens=${maxTokens}) malgré ${MAX_LENGTH_CONTINUATIONS} relance(s) : rien n'est publié.`,
         errorCode: 'omniroute_output_truncated',
         errorFamily: 'configuration',
         retryNotBefore: null,
@@ -526,7 +540,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<OmniRouteEx
       truncated.costUsd = result.costUsd;
       truncated.sessionParams = sessionParams;
       truncated.sessionDisplayId = sessionParams.sessionId;
-      truncated.resultJson = { turns: result.turns, stopReason: result.stopReason, completion: result.completion, durationMs: Date.now() - started, ...delegationResultFields(result) };
+      truncated.resultJson = { turns: result.turns, stopReason: result.stopReason, completion: result.completion, durationMs: Date.now() - started, contextWindow, ...delegationResultFields(result) };
       return truncated;
     }
 
@@ -560,6 +574,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<OmniRouteEx
         completion: result.completion,
         durationMs: Date.now() - started,
         sessionId: sessionParams.sessionId,
+        contextWindow,
         ...delegationResultFields(result),
       };
       return noFinal;
@@ -597,6 +612,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<OmniRouteEx
         sessionId: sessionParams.sessionId,
         resumedSession: session.attempt.resumed,
         ...(session.attempt.freshRetry ? { sessionRestartedFresh: true } : {}),
+        // ACC-3085 — fenêtre détectée et seuils appliqués, avec leur source.
+        contextWindow,
         ...delegationResultFields(result),
         // Paperclip lit `resultJson.finalResponse` pour décider de la réponse
         // publiée (`heartbeat-run-summary.ts:readMarkedAdapterFinalResponse` :

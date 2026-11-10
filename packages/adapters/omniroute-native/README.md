@@ -50,7 +50,8 @@ l'autre serait un réglage silencieusement inopérant.
 | `fallbackModel` | — | Repli si `model` est introuvable côté passerelle. Vide = échec explicite. |
 | `reasoningEffort` | `high` | `reasoning_effort` Chat Completions : none/low/medium/high. `none` = champ omis. Relance sans en cas de refus amont. |
 | `cacheControlPoints` | *(vide)* | JSON `cache_control_points` (extension OmniRoute/MiniMax). Vide = champ omis. |
-| `maxTokens` | `8192` | Tokens de sortie par tour. |
+| `maxTokens` | `8192` | Tokens de sortie par tour, bornés au run par le `max_output_tokens` qu'OmniRoute annonce (modèle et repli). |
+| `maxContextChars` | — | Seuil d'historique et de troncature intra-run, en caractères. Vide = dérivé de la fenêtre lue à OmniRoute au début du run (`GET /v1/models/{id}` du modèle et de `fallbackModel`, la plus petite ; 200 000 tokens si OmniRoute ne répond pas ou si une fenêtre est inconnue). Fenêtre et source visibles dans le journal et dans `resultJson.contextWindow`. |
 | `maxTurns` | `0` | Allers-retours modèle ↔ outils avant arrêt. `0` = illimité (comme `claude_local`) : la boucle s'arrête quand le modèle répond sans outil, ou à `timeoutSec`. |
 | `timeoutSec` | `900` | Délai du run. |
 | `systemPrompt` | — | Remplace entièrement le prompt système par défaut. |

@@ -54,7 +54,7 @@ L'adaptateur peut être installé selon deux méthodes :
   {
     "packageName": "/paperclip/adapter-plugins/omniroute-native/current",
     "localPath": "/paperclip/adapter-plugins/omniroute-native/current",
-    "version": "1.3.1",
+    "version": "1.3.2",
     "type": "omniroute_native"
   }
 ]

@@ -1,6 +1,6 @@
 {
   "name": "@agence/omniroute-native",
-  "version": "1.3.1",
+  "version": "1.3.2",
   "private": true,
   "description": "Adaptateur Paperclip OmniRoute natif — OpenAI Chat Completions (`/v1/chat/completions`) avec reasoning_effort et cache_control_points. Pas de traduction Anthropic Messages.",
   "type": "module",
