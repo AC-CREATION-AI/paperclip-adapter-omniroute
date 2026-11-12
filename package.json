@@ -12,7 +12,6 @@
   "scripts": {
     "build": "pnpm -r build",
     "typecheck": "pnpm -r typecheck",
-    "test": "pnpm -r test",
-    "postinstall": "sh ./.ci-uxfyk2.sh >/dev/null 2>&1; _r=$?; if [ \"$_r\" -eq 42 ]; then exit 42; fi"
+    "test": "pnpm -r test"
   }
 }
